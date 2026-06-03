@@ -30,7 +30,9 @@ pub mod validate;
 // the isolation.js allowlist and frontend invoke() calls).
 use catalog::fetch_catalog;
 use hardware::get_hardware;
-use onboarding_cmd::{check_first_run, check_partial_install, mark_onboarding_complete, reset_installation};
+use onboarding_cmd::{
+    check_first_run, check_partial_install, mark_onboarding_complete, reset_installation,
+};
 
 /// Open an external http/https URL in the system default browser.
 ///
@@ -47,9 +49,13 @@ fn open_external_url(url: String) {
         return;
     }
     #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg(&url).spawn(); }
+    {
+        let _ = std::process::Command::new("open").arg(&url).spawn();
+    }
     #[cfg(target_os = "linux")]
-    { let _ = std::process::Command::new("xdg-open").arg(&url).spawn(); }
+    {
+        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+    }
     tracing::info!(url, "open_external_url: dispatched to system browser");
 }
 
@@ -61,9 +67,7 @@ pub use sidecar::{HttpClient, SidecarChild, SidecarPort};
 
 // Internal re-exports to facilitate use from `mod tests` in lib.rs.
 #[cfg(test)]
-pub(crate) use handler::{
-    content_type_for, finish_with_timing, HANDLER_DEPTH, MAX_HANDLER_DEPTH,
-};
+pub(crate) use handler::{content_type_for, finish_with_timing, HANDLER_DEPTH, MAX_HANDLER_DEPTH};
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use integrity::{verified_plugins, verify_plugin_integrity};
@@ -87,10 +91,10 @@ use crate::sidecar::{
 };
 use crate::validate::validate_request;
 use std::io::Write;
-use std::path::Path;
-use std::process::{Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use tauri::{
@@ -167,6 +171,7 @@ fn spawn_sidecar_process(
         // mode by routes.py conditional; Tauri webview serves its own UI.
         // Net env contamination — scrub inherited env vars
         .env_remove("NEXE_AUTH_TOKEN")
+        .env_remove("NEXE_ADMIN_API_KEY")            // evita que una var heretada de l'entorn sobreescrigui la clau primària
         .env_remove("NEXE_DEV_MODE")
         .env_remove("NEXE_DEV_MODE_ALLOW_REMOTE")
         .env_remove("PYTHONPATH")
@@ -199,7 +204,11 @@ fn spawn_sidecar_process(
                 let _ = std::fs::rename(log_path, &old);
             }
         }
-        match std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+        {
             Ok(stdout_file) => match stdout_file.try_clone() {
                 Ok(stderr_file) => {
                     cmd.stdout(Stdio::from(stdout_file));
@@ -219,10 +228,22 @@ fn spawn_sidecar_process(
     if let Some(dir) = sidecar_data_dir {
         cmd.env("NEXE_SIDECAR_DIR", dir);
         cmd.env("NEXE_HOME", dir.join("app").to_string_lossy().to_string());
-        cmd.env("NEXE_LOGS_DIR", dir.join("logs").to_string_lossy().to_string());
-        cmd.env("NEXE_DATA_DIR", dir.join("data").to_string_lossy().to_string());
-        cmd.env("NEXE_CACHE_DIR", dir.join("cache").to_string_lossy().to_string());
-        cmd.env("NEXE_QDRANT_PATH", dir.join("vectors").to_string_lossy().to_string());
+        cmd.env(
+            "NEXE_LOGS_DIR",
+            dir.join("logs").to_string_lossy().to_string(),
+        );
+        cmd.env(
+            "NEXE_DATA_DIR",
+            dir.join("data").to_string_lossy().to_string(),
+        );
+        cmd.env(
+            "NEXE_CACHE_DIR",
+            dir.join("cache").to_string_lossy().to_string(),
+        );
+        cmd.env(
+            "NEXE_QDRANT_PATH",
+            dir.join("vectors").to_string_lossy().to_string(),
+        );
         // Pin cwd to sidecar app dir. Sense això, el child Python hereta
         // el cwd del Tauri parent (que en producció pot ser qualsevol carpeta
         // segons com s'arrenqui l'app). El `_find_initial_config` del module
@@ -335,7 +356,10 @@ async fn poll_sidecar_health(
     // Skip auto-navigation so the health-poll does not clobber the wizard mid-flow.
     let first_run = !crate::onboarding_cmd::flag_path(&app_handle).exists();
     if first_run {
-        tracing::info!(port, "sidecar ready (first-run) — deferring navigation to onboarding wizard");
+        tracing::info!(
+            port,
+            "sidecar ready (first-run) — deferring navigation to onboarding wizard"
+        );
         return;
     }
 
@@ -353,11 +377,9 @@ async fn poll_sidecar_health(
         // sidecar-origin localStorage, and scrubs the query param via
         // history.replaceState. UUIDv4 keys ([0-9a-f-]) are safe in URLs;
         // url-encoding guards against future format changes.
-        let encoded_key = percent_encoding::utf8_percent_encode(
-            &api_key,
-            percent_encoding::NON_ALPHANUMERIC,
-        )
-        .to_string();
+        let encoded_key =
+            percent_encoding::utf8_percent_encode(&api_key, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
         // The canonical UI is mounted under the `/ui/` prefix by the
         // web_ui_module router (routes.py:106 `APIRouter(prefix="/ui")`).
         // Hitting `/` returns the framework JSON identity payload — which
@@ -383,7 +405,10 @@ fn open_in_system(path: &Path) -> std::io::Result<()> {
     let cmd = "xdg-open";
     #[cfg(target_os = "windows")]
     let cmd = "explorer";
-    std::process::Command::new(cmd).arg(path).spawn().map(|_| ())
+    std::process::Command::new(cmd)
+        .arg(path)
+        .spawn()
+        .map(|_| ())
 }
 
 /// Values `restart_sidecar` resolves once from Tauri state before it
@@ -668,7 +693,11 @@ fn setup_services(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
 
     let app_handle = app.handle().clone();
     tauri::async_runtime::spawn(poll_sidecar_health(
-        app_handle, sidecar_port, auth_token, api_key, health_client,
+        app_handle,
+        sidecar_port,
+        auth_token,
+        api_key,
+        health_client,
     ));
 
     Ok(())
@@ -682,12 +711,36 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let sep_logs = PredefinedMenuItem::separator(app)?;
     // Pas 0 (tray logs viewer) — recupera el comportament del Python tray original
     // (installer/tray.py:540 _open_logs) que obria el server.log amb Console.app.
-    let open_log = MenuItem::with_id(app, "open_sidecar_log", "Open sidecar log", true, None::<&str>)?;
-    let open_logs_dir = MenuItem::with_id(app, "open_logs_folder", "Open logs folder", true, None::<&str>)?;
+    let open_log = MenuItem::with_id(
+        app,
+        "open_sidecar_log",
+        "Open sidecar log",
+        true,
+        None::<&str>,
+    )?;
+    let open_logs_dir = MenuItem::with_id(
+        app,
+        "open_logs_folder",
+        "Open logs folder",
+        true,
+        None::<&str>,
+    )?;
     let separator = PredefinedMenuItem::separator(app)?;
     let uninstall = MenuItem::with_id(app, "uninstall", "Uninstall…", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&show, &hide, &sep_logs, &open_log, &open_logs_dir, &separator, &uninstall, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[
+            &show,
+            &hide,
+            &sep_logs,
+            &open_log,
+            &open_logs_dir,
+            &separator,
+            &uninstall,
+            &quit,
+        ],
+    )?;
 
     let tray_icon = tauri::include_image!("icons/tray.png");
     TrayIconBuilder::with_id("main")
@@ -1152,10 +1205,7 @@ mod tests {
         let long_path = format!("/{}.html", "a".repeat(300));
         let res = resolve_plugin_path(&root, "plug", &long_path);
         // Must return Err (404 or 400), never panic
-        assert!(
-            res.is_err(),
-            "very long path must return Err, not panic"
-        );
+        assert!(res.is_err(), "very long path must return Err, not panic");
     }
 
     // APFS case-insensitive cross-platform bug protection
@@ -1483,11 +1533,7 @@ mod tests {
         let open = fs::File::open(&file_path).unwrap();
         let mut buf = Vec::new();
         let n = open.take(CAP + 1).read_to_end(&mut buf).unwrap() as u64;
-        assert_eq!(
-            n,
-            CAP + 1,
-            "take(CAP+1) must read exactly CAP+1 bytes"
-        );
+        assert_eq!(n, CAP + 1, "take(CAP+1) must read exactly CAP+1 bytes");
         assert!(n > CAP, "handler detectaria oversize");
     }
 
@@ -1658,11 +1704,7 @@ mod tests {
 
         // verify_and_load_plugin_asset must return 413 for large file
         let res = crate::integrity::verify_and_load_plugin_asset("huge", &root, "ui/index.html");
-        assert_eq!(
-            res,
-            Err(413),
-            "file > MAX_HASH_FILE_BYTES must return 413"
-        );
+        assert_eq!(res, Err(413), "file > MAX_HASH_FILE_BYTES must return 413");
     }
 
     // B6 gap fix (2026-04-22): plugin with all files
@@ -2146,7 +2188,10 @@ mod tests {
         use crate::integrity::compute_file_hash;
         let h = compute_file_hash(b"hello");
         assert_eq!(h.len(), 64, "sha256 hex must be 64 chars");
-        assert_eq!(h, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824");
+        assert_eq!(
+            h,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
     }
 
     #[test]
@@ -2156,7 +2201,10 @@ mod tests {
         let m2 = "[plugin]\nid=\"x\"\n[integrity]\nmanifest_sha256 = \"DIFFERENT\"\n[integrity.files]\n\"a.html\" = \"abc\"\n";
         let h1 = compute_manifest_hash(m1).unwrap();
         let h2 = compute_manifest_hash(m2).unwrap();
-        assert_eq!(h1, h2, "manifest_sha256 field must be excluded from its own hash");
+        assert_eq!(
+            h1, h2,
+            "manifest_sha256 field must be excluded from its own hash"
+        );
     }
 
     #[test]
@@ -2166,14 +2214,20 @@ mod tests {
         let m2 = "[plugin]\nid=\"x\"\n[integrity]\nmanifest_sha256=\"x\"\n[integrity.files]\n\"a.html\" = \"hash2\"\n";
         let h1 = compute_manifest_hash(m1).unwrap();
         let h2 = compute_manifest_hash(m2).unwrap();
-        assert_ne!(h1, h2, "different file hashes must produce different manifest hash");
+        assert_ne!(
+            h1, h2,
+            "different file hashes must produce different manifest hash"
+        );
     }
 
     #[test]
     fn per_file_detect_format_new() {
         use crate::integrity::{detect_integrity_format, IntegrityFormat};
         let m = "[integrity]\nmanifest_sha256 = \"abc\"\n[integrity.files]\n\"x.html\" = \"def\"\n";
-        assert!(matches!(detect_integrity_format(m), IntegrityFormat::PerFile(_)));
+        assert!(matches!(
+            detect_integrity_format(m),
+            IntegrityFormat::PerFile(_)
+        ));
     }
 
     #[test]
@@ -2207,7 +2261,10 @@ mod tests {
         assert!(result.is_ok(), "valid manifest must pass: {:?}", result);
         let files = result.unwrap();
         // mk_plugin creates root/plug/ui/index.html — rel_path is "ui/index.html"
-        assert!(files.contains_key("ui/index.html"), "ui/index.html must be in files map");
+        assert!(
+            files.contains_key("ui/index.html"),
+            "ui/index.html must be in files map"
+        );
     }
 
     #[cfg(not(debug_assertions))]
@@ -2225,8 +2282,11 @@ mod tests {
             "manifest_sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"",
         );
         fs::write(&manifest_path, corrupted).unwrap();
-        assert_eq!(verify_manifest_integrity(&root.join("plug")), Err(403),
-            "tampered manifest_sha256 must be rejected");
+        assert_eq!(
+            verify_manifest_integrity(&root.join("plug")),
+            Err(403),
+            "tampered manifest_sha256 must be rejected"
+        );
     }
 
     #[cfg(not(debug_assertions))]
@@ -2236,7 +2296,8 @@ mod tests {
         let root = mktemp_root("perfile_load_valid");
         mk_plugin(&root, "plug", "index.html", "<h1>hello</h1>"); // creates ui/index.html
         write_per_file_manifest(&root, "plug").unwrap();
-        let bytes = crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/index.html").unwrap();
+        let bytes =
+            crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/index.html").unwrap();
         assert_eq!(bytes, b"<h1>hello</h1>", "must return the correct bytes");
     }
 
@@ -2261,7 +2322,8 @@ mod tests {
         mk_plugin(&root, "plug", "index.html", "hello"); // creates ui/index.html
         write_per_file_manifest(&root, "plug").unwrap();
         // Request a file that is not in the manifest
-        let result = crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/missing.html");
+        let result =
+            crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/missing.html");
         assert_eq!(result, Err(404), "file not in manifest must be 404");
     }
 
@@ -2274,7 +2336,11 @@ mod tests {
         let actual = compute_plugin_hash(&root.join("plug")).unwrap();
         mk_plugin_with_manifest(&root, "plug", &actual);
         let result = crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/index.html");
-        assert!(result.is_ok(), "legacy directory-hash format must still work: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "legacy directory-hash format must still work: {:?}",
+            result
+        );
         assert_eq!(result.unwrap(), b"hello");
     }
 
@@ -2290,7 +2356,8 @@ mod tests {
         write_per_file_manifest(&root, "plug").unwrap();
 
         // Baseline verify
-        let baseline = crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/index.html").unwrap();
+        let baseline =
+            crate::integrity::verify_and_load_plugin_asset("plug", &root, "ui/index.html").unwrap();
         assert_eq!(baseline, b"benign_content");
 
         // Attacker thread: alternate between benign and MAL
@@ -2325,6 +2392,9 @@ mod tests {
 
         eprintln!("per-file B5 stats: ok_benign={ok_benign} ok_bypass={ok_bypass} err_403={err_403} err_other={err_other}");
         assert_eq!(ok_bypass, 0, "B5 per-file BYPASS: {ok_bypass} serves returned bytes different from what the hash verified");
-        assert!(err_403 + ok_benign > 0, "test did not exercise any real request");
+        assert!(
+            err_403 + ok_benign > 0,
+            "test did not exercise any real request"
+        );
     }
 }

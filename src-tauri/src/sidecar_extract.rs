@@ -28,7 +28,9 @@
 /// to the launcher process.
 // Dead in debug builds (called only under #[cfg(not(debug_assertions))]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
-pub(crate) fn ensure_sidecar_extracted(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+pub(crate) fn ensure_sidecar_extracted(
+    app: &tauri::AppHandle,
+) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
 
     let data_dir = app
@@ -41,8 +43,8 @@ pub(crate) fn ensure_sidecar_extracted(app: &tauri::AppHandle) -> Result<std::pa
     // Resolve the expected marker value once (SHA preferred, version fallback).
     // Reading it before the `needs_extract` check is what lets the lock-loser
     // branch below detect completion correctly.
-    let expected = read_sidecar_sha256(app)
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    let expected =
+        read_sidecar_sha256(app).unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
     let needs_extract = match std::fs::read_to_string(&marker) {
         Ok(v) => v.trim() != expected,
@@ -63,8 +65,7 @@ pub(crate) fn ensure_sidecar_extracted(app: &tauri::AppHandle) -> Result<std::pa
             expected = %expected,
             "extracting sidecar bundle"
         );
-        std::fs::create_dir_all(&sidecar_dir)
-            .map_err(|e| format!("create sidecar dir: {e}"))?;
+        std::fs::create_dir_all(&sidecar_dir).map_err(|e| format!("create sidecar dir: {e}"))?;
 
         // Prevent two app launches from racing to
         // unpack the same tarball into the same target dir (interleaved writes
@@ -95,12 +96,7 @@ pub(crate) fn ensure_sidecar_extracted(app: &tauri::AppHandle) -> Result<std::pa
                     lock_path.display()
                 ));
             }
-            Err(e) => {
-                return Err(format!(
-                    "acquire extract lock {}: {e}",
-                    lock_path.display()
-                ))
-            }
+            Err(e) => return Err(format!("acquire extract lock {}: {e}", lock_path.display())),
         };
 
         // RAII guard removes the lock file when this scope ends (success or panic).
@@ -126,8 +122,8 @@ pub(crate) fn ensure_sidecar_extracted(app: &tauri::AppHandle) -> Result<std::pa
             return Err(format!("sidecar bundle integrity check failed: {e}"));
         }
 
-        let file = std::fs::File::open(&tarball)
-            .map_err(|e| format!("open sidecar tarball: {e}"))?;
+        let file =
+            std::fs::File::open(&tarball).map_err(|e| format!("open sidecar tarball: {e}"))?;
         let gz = flate2::read::GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         archive.set_overwrite(true);
@@ -200,10 +196,7 @@ fn parse_sha256_digest(raw: &str) -> Option<String> {
 /// file is missing the function returns `Ok(())` so old builds keep working;
 /// future release builds will start shipping the digest unconditionally.
 #[cfg_attr(debug_assertions, allow(dead_code))]
-fn verify_tarball_sha256(
-    app: &tauri::AppHandle,
-    tarball: &std::path::Path,
-) -> Result<(), String> {
+fn verify_tarball_sha256(app: &tauri::AppHandle, tarball: &std::path::Path) -> Result<(), String> {
     use tauri::Manager;
 
     let digest_resource = match app.path().resolve(
@@ -265,15 +258,18 @@ fn verify_sha256_against_digest_file(
         .ok_or_else(|| "expected digest line has no token".to_string())?
         .to_ascii_lowercase();
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(format!("expected digest is not a 64-char hex string: {expected:?}"));
+        return Err(format!(
+            "expected digest is not a 64-char hex string: {expected:?}"
+        ));
     }
 
     let mut hasher = Sha256::new();
-    let mut file = std::fs::File::open(tarball)
-        .map_err(|e| format!("open tarball: {e}"))?;
+    let mut file = std::fs::File::open(tarball).map_err(|e| format!("open tarball: {e}"))?;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| format!("read tarball: {e}"))?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("read tarball: {e}"))?;
         if n == 0 {
             break;
         }
@@ -391,8 +387,8 @@ mod tests {
     #[test]
     fn parse_sha256_digest_accepts_hex_with_filename() {
         let line = format!("{KNOWN_SHA256}  sidecar-bundle.tar.gz\n");
-        let parsed = super::parse_sha256_digest(&line)
-            .expect("hex+filename line should parse to bare hex");
+        let parsed =
+            super::parse_sha256_digest(&line).expect("hex+filename line should parse to bare hex");
         assert_eq!(parsed, KNOWN_SHA256);
     }
 

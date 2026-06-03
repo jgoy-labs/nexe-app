@@ -343,7 +343,9 @@ fn update_verification_cache(plugin_id: &str, actual_hash: String) {
     }
     guard.put(
         plugin_id.to_string(),
-        CacheEntry { known_hash: actual_hash },
+        CacheEntry {
+            known_hash: actual_hash,
+        },
     );
 }
 
@@ -365,7 +367,11 @@ pub(crate) fn verify_and_load_plugin_asset(
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         if let IntegrityFormat::PerFile(_) = detect_integrity_format(&content) {
             let files_map = verify_manifest_integrity(&plugin_dir)?;
-            return verify_and_load_file_asset_per_file(&plugin_dir, requested_rel_path, &files_map);
+            return verify_and_load_file_asset_per_file(
+                &plugin_dir,
+                requested_rel_path,
+                &files_map,
+            );
         }
     }
 
@@ -646,16 +652,23 @@ pub fn write_per_file_manifest(root: &Path, plugin_id: &str) -> Result<(), Strin
 
     let mut file_hashes = toml::map::Map::new();
     for abs_path in &files {
-        let rel = abs_path.strip_prefix(&plugin_dir).map_err(|_| "strip_prefix")?;
+        let rel = abs_path
+            .strip_prefix(&plugin_dir)
+            .map_err(|_| "strip_prefix")?;
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if rel_str == "manifest.toml" { continue; }
+        if rel_str == "manifest.toml" {
+            continue;
+        }
         let content = std::fs::read(abs_path).map_err(|e| format!("read: {e}"))?;
         file_hashes.insert(rel_str, toml::Value::String(compute_file_hash(&content)));
     }
 
     // Build the TOML value tree (without manifest_sha256 first)
     let mut integrity = toml::map::Map::new();
-    integrity.insert("manifest_sha256".into(), toml::Value::String("placeholder".into()));
+    integrity.insert(
+        "manifest_sha256".into(),
+        toml::Value::String("placeholder".into()),
+    );
     integrity.insert("files".into(), toml::Value::Table(file_hashes));
 
     let mut plugin = toml::map::Map::new();

@@ -104,9 +104,15 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
             // BLOCKED_PATH list. Timeout 1.5s — the endpoint schedules a
             // 0.3s delayed SIGINT and returns 200 immediately, so 1.5s is
             // ample headroom.
-            let port_opt = app_for_shutdown.try_state::<crate::SidecarPort>().map(|s| s.get());
-            let api_key_opt = app_for_shutdown.try_state::<crate::auth::ApiKey>().map(|s| s.0.clone());
-            let client_opt = app_for_shutdown.try_state::<crate::HttpClient>().map(|s| s.0.clone());
+            let port_opt = app_for_shutdown
+                .try_state::<crate::SidecarPort>()
+                .map(|s| s.get());
+            let api_key_opt = app_for_shutdown
+                .try_state::<crate::auth::ApiKey>()
+                .map(|s| s.0.clone());
+            let client_opt = app_for_shutdown
+                .try_state::<crate::HttpClient>()
+                .map(|s| s.0.clone());
 
             if let (Some(port), Some(api_key), Some(client)) = (port_opt, api_key_opt, client_opt) {
                 let url = format!("http://127.0.0.1:{port}/admin/system/shutdown");
@@ -118,15 +124,21 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
                     .send()
                     .await
                 {
-                    Ok(resp) => tracing::info!(status = %resp.status(), "sidecar shutdown response"),
-                    Err(e) => tracing::warn!(error = %e, "sidecar shutdown POST failed (will SIGKILL)"),
+                    Ok(resp) => {
+                        tracing::info!(status = %resp.status(), "sidecar shutdown response")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sidecar shutdown POST failed (will SIGKILL)")
+                    }
                 }
                 // Give the sidecar the 0.3s scheduled SIGINT + lifespan teardown
                 // some headroom before kill_sidecar_child polls (it already
                 // waits up to 1.5s on its own, so 400ms here is enough).
                 tauri::async_runtime::spawn_blocking(|| {
                     std::thread::sleep(Duration::from_millis(400));
-                }).await.ok();
+                })
+                .await
+                .ok();
             } else {
                 tracing::warn!("missing state for graceful POST (port/api_key/http) — skipping");
             }
@@ -149,9 +161,7 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
 ///
 /// Returns `Some(pid)` if there was a Child that was handled, `None` if already
 /// clean (idempotent).
-pub(crate) fn kill_sidecar_child(
-    mutex: &Mutex<Option<std::process::Child>>,
-) -> Option<u32> {
+pub(crate) fn kill_sidecar_child(mutex: &Mutex<Option<std::process::Child>>) -> Option<u32> {
     let mut guard = match mutex.lock() {
         Ok(g) => g,
         Err(poisoned) => {

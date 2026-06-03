@@ -34,8 +34,7 @@ pub struct CatalogModel {
 }
 
 /// Embedded fallback catalog (built into the binary at compile time).
-const FALLBACK_CATALOG: &str =
-    include_str!("../resources/catalog_fallback.json");
+const FALLBACK_CATALOG: &str = include_str!("../resources/catalog_fallback.json");
 
 /// Remote manifest URL. Fetched with a 5 s timeout; falls back to embedded on any error.
 ///
@@ -108,13 +107,15 @@ mod tests {
     fn fallback_catalog_is_valid_json() {
         let models: Vec<CatalogModel> =
             serde_json::from_str(FALLBACK_CATALOG).expect("embedded catalog must be valid JSON");
-        assert!(!models.is_empty(), "embedded catalog must have at least one model");
+        assert!(
+            !models.is_empty(),
+            "embedded catalog must have at least one model"
+        );
     }
 
     #[test]
     fn fallback_catalog_models_have_required_fields() {
-        let models: Vec<CatalogModel> =
-            serde_json::from_str(FALLBACK_CATALOG).unwrap();
+        let models: Vec<CatalogModel> = serde_json::from_str(FALLBACK_CATALOG).unwrap();
         for m in &models {
             assert!(!m.name.is_empty(), "model name must not be empty");
             assert!(m.ram_gb > 0.0, "model ram_gb must be > 0 for {}", m.name);
@@ -129,8 +130,7 @@ mod tests {
 
     #[test]
     fn fallback_catalog_has_minimum_models() {
-        let models: Vec<CatalogModel> =
-            serde_json::from_str(FALLBACK_CATALOG).unwrap();
+        let models: Vec<CatalogModel> = serde_json::from_str(FALLBACK_CATALOG).unwrap();
         assert!(
             models.len() >= 3,
             "fallback catalog must have >= 3 models, got {}",
@@ -168,8 +168,7 @@ mod tests {
 
     #[test]
     fn fallback_catalog_non_gated_models_have_none() {
-        let models: Vec<CatalogModel> =
-            serde_json::from_str(FALLBACK_CATALOG).unwrap();
+        let models: Vec<CatalogModel> = serde_json::from_str(FALLBACK_CATALOG).unwrap();
         // Non-gated models (e.g. Qwen3.5 4B) must deserialize with gated=None
         let non_gated = models.iter().find(|m| m.name == "Qwen3.5 4B");
         if let Some(m) = non_gated {

@@ -105,8 +105,8 @@ impl Drop for RestartGuard {
 /// conflict — it exits with error and lets Tauri retry. Use `verify_port_free`
 /// right before spawn to detect the rare TOCTOU race before it reaches server-nexe.
 pub fn reserve_ephemeral_port() -> Result<u16, String> {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| format!("reserve_ephemeral_port: {e}"))?;
+    let listener =
+        TcpListener::bind("127.0.0.1:0").map_err(|e| format!("reserve_ephemeral_port: {e}"))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("local_addr: {e}"))?
@@ -130,7 +130,9 @@ pub fn verify_port_free(port: u16) -> Result<(), String> {
         .map_err(|e| format!("verify_port_free parse: {e}"))?;
     match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
         Err(_) => Ok(()), // connection refused = port is free
-        Ok(_) => Err(format!("port {port} is already in use (TOCTOU race or leftover process)")),
+        Ok(_) => Err(format!(
+            "port {port} is already in use (TOCTOU race or leftover process)"
+        )),
     }
 }
 
@@ -198,9 +200,7 @@ pub(crate) fn resolve_sidecar_path(_app: &tauri::AppHandle) -> Result<PathBuf, S
 /// allow tests with temporary directories (without depending on the real `CARGO_MANIFEST_DIR`).
 /// Returns the path to the dev `nexe-sidecar` or an error if it does not exist.
 pub(crate) fn resolve_sidecar_path_dev(manifest_dir: &std::path::Path) -> Result<PathBuf, String> {
-    let project_root = manifest_dir
-        .parent()
-        .ok_or("manifest_dir has no parent")?;
+    let project_root = manifest_dir.parent().ok_or("manifest_dir has no parent")?;
     let path = project_root
         .join("target")
         .join("sidecar")
@@ -316,7 +316,10 @@ mod tests {
 
         let err = resolve_sidecar_path_prod(&exe).expect_err("should fail");
         assert!(err.contains("does not exist"), "got {err:?}");
-        assert!(err.contains("build-sidecar.sh"), "should hint at build step: got {err:?}");
+        assert!(
+            err.contains("build-sidecar.sh"),
+            "should hint at build step: got {err:?}"
+        );
     }
 
     // Test kill_sidecar_child with real subprocess (sleep 60s)

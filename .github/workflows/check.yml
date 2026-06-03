@@ -31,6 +31,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      # CI-H02: fail-fast de les 3 fonts internes de nexe-app.
+      # El check complet de les 4 fonts (inclou server-nexe/pyproject.toml)
+      # corre al job `version-sync` d'aquest mateix workflow.
+      - name: version sync check (3 fonts internes nexe-app)
+        shell: bash
+        run: bash scripts/check-version-sync.sh --skip-server-nexe
+
       - name: Install Linux WebKitGTK deps
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -155,6 +162,34 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.88.0
 
-      - name: cargo check at MSRV 1.88
+      # CI-H01: 'cargo build' (no 'check') per cobrir també codegen/linking a MSRV 1.88.
+      - name: cargo build at MSRV 1.88
         working-directory: src-tauri
-        run: cargo check --locked
+        run: cargo build --locked
+
+  # CI-H02: check complet de les 4 fonts de versió (nexe-app + server-nexe).
+  # Job separat i lleuger — no necessita Rust ni Node, només python3 (preinstal·lat).
+  # Fa checkout de tots dos repos per poder comparar les 4 fonts en un sol runner.
+  version-sync:
+    name: version sync (4 fonts)
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout nexe-app
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Checkout server-nexe
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: factoria-nexe/server-nexe
+          persist-credentials: false
+          fetch-depth: 1
+          path: _server-nexe
+
+      - name: Check version sync across all 4 sources
+        shell: bash
+        run: bash scripts/check-version-sync.sh _server-nexe

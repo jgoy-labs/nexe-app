@@ -76,9 +76,21 @@ fn reset_installation_inner(app: &AppHandle, full: bool) {
         let _ = std::fs::remove_dir_all(sidecar.join("data").join("models"));
         let _ = std::fs::remove_dir_all(sidecar.join("vectors"));
         let _ = std::fs::remove_dir_all(sidecar.join("storage"));
+
+        // WebView storage (localStorage/IndexedDB) lives outside the app data
+        // dir, in a platform-specific WebKit location keyed by bundle id.
+        #[cfg(target_os = "macos")]
         if let Ok(home) = std::env::var("HOME") {
-            let webkit = std::path::PathBuf::from(&home)
-                .join("Library/WebKit/com.nexe.app");
+            let webkit = std::path::PathBuf::from(&home).join("Library/WebKit/com.nexe.app");
+            let _ = std::fs::remove_dir_all(&webkit);
+        }
+
+        // WebKitGTK stores its data under XDG data home, which `dirs::data_local_dir()`
+        // resolves to on Linux (`~/.local/share`), keyed by the same bundle id used
+        // for logs (see logging.rs `APP_DATA_SUBDIR`).
+        #[cfg(target_os = "linux")]
+        if let Some(local) = dirs::data_local_dir() {
+            let webkit = local.join("com.nexe.app");
             let _ = std::fs::remove_dir_all(&webkit);
         }
     }
@@ -130,14 +142,20 @@ mod tests {
     #[test]
     fn no_flag_means_first_run() {
         let tmp = TempDir::new().unwrap();
-        assert!(!flag_exists(tmp.path()), "fresh dir => first_run should be true");
+        assert!(
+            !flag_exists(tmp.path()),
+            "fresh dir => first_run should be true"
+        );
     }
 
     #[test]
     fn flag_present_means_not_first_run() {
         let tmp = TempDir::new().unwrap();
         write_flag(tmp.path());
-        assert!(flag_exists(tmp.path()), "flag written => first_run should be false");
+        assert!(
+            flag_exists(tmp.path()),
+            "flag written => first_run should be false"
+        );
     }
 
     #[test]

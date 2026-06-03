@@ -197,7 +197,10 @@ mod tests {
     #[test]
     fn rejects_nonexistent_plugin() {
         let root = std::env::temp_dir().join("nexe-validate-noexist");
-        assert_eq!(resolve_plugin_path(&root, "no-such-plugin", "/index.html"), Err(404));
+        assert_eq!(
+            resolve_plugin_path(&root, "no-such-plugin", "/index.html"),
+            Err(404)
+        );
     }
 
     #[test]
@@ -221,7 +224,10 @@ mod tests {
         std::fs::write(ui_dir.join("ok.html"), "ok").unwrap();
         std::fs::write(root.join("evil/secret.txt"), "secret").unwrap();
 
-        assert_eq!(resolve_plugin_path(&root, "evil", "/../secret.txt"), Err(403));
+        assert_eq!(
+            resolve_plugin_path(&root, "evil", "/../secret.txt"),
+            Err(403)
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

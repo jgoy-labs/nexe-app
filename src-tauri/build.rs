@@ -15,6 +15,7 @@ fn main() {
     let sha = manifest_dir.join("sidecar-bundle.sha256");
     if !sha.exists() {
         let _ = std::fs::write(&sha, b"");
+        println!("cargo:warning=sidecar-bundle.sha256 absent — placeholder created, sidecar integrity check skipped (dev/CI build, not a release bundle)");
     }
     tauri_build::build()
 }

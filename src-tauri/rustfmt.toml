@@ -1,6 +1,8 @@
+# Only stable rustfmt options: the repo pins a stable toolchain
+# (rust-toolchain.toml) for reproducible builds, so `cargo fmt` must not
+# rely on nightly-only options (imports_granularity / group_imports /
+# format_strings) — on stable they are silently ignored, which leaves the
+# formatting inconsistent between local and CI.
 edition = "2021"
 max_width = 100
-imports_granularity = "Crate"
-group_imports = "StdExternalCrate"
 reorder_imports = true
-format_strings = true

@@ -309,8 +309,8 @@ pub(crate) async fn fetch_from_sidecar(
     // creating a NEW client per invoke → connection pool leak (fds), DNS resolver
     // re-init, TLS session cache cleared.
     let client = http.0.clone();
-    let http_method = reqwest::Method::from_bytes(method.as_bytes())
-        .map_err(|_| "INVALID_METHOD".to_string())?;
+    let http_method =
+        reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "INVALID_METHOD".to_string())?;
     let token = &auth_state.0;
     let mut req = client
         .request(http_method, &url)
@@ -320,10 +320,7 @@ pub(crate) async fn fetch_from_sidecar(
         // the endpoint (FastAPI route handlers).
         req = req.body(b);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| format!("reqwest send: {e}"))?;
+    let resp = req.send().await.map_err(|e| format!("reqwest send: {e}"))?;
 
     // OOM guard: cap response body size at 10 MiB before draining it
     // into memory. A misbehaving (or malicious) sidecar could otherwise return

@@ -36,9 +36,12 @@ pub fn get_hardware() -> HardwareInfo {
     let is_apple_silicon = cfg!(target_arch = "aarch64") && cfg!(target_os = "macos");
 
     let disks = Disks::new_with_refreshed_list();
+    // Prefer the root volume (macOS/Linux); on Windows or unusual mounts there is
+    // no "/" so fall back to the disk with the most free space.
     let disk_free_gb = disks
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
+        .or_else(|| disks.iter().max_by_key(|d| d.available_space()))
         .map(|d| d.available_space() / (1024 * 1024 * 1024))
         .unwrap_or(0);
 
