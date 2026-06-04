@@ -37,6 +37,24 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
+      # H-001: The sidecar bundle (Python venv + app) requires scripts/build-sidecar.sh
+      # which needs a full Python env (uv, fastembed, etc.) — not available in CI.
+      # We create a minimal placeholder so Tauri can resolve the resource path and
+      # produce a valid DMG structure. The resulting DMG contains a stub sidecar;
+      # functional sidecar smoke testing requires a dedicated CI environment.
+      # TODO: add build-sidecar.sh step + pnpm tauri:build when CI has Python setup.
+      - name: sidecar bundle placeholder (CI only)
+        run: |
+          mkdir -p src-tauri
+          if [ ! -f src-tauri/sidecar-bundle.tar.gz ]; then
+            TRIPLE=$(rustc -vV | grep '^host:' | awk '{print $2}')
+            STUB="src-tauri/binaries/nexe-sidecar-$TRIPLE"
+            mkdir -p "$(dirname "$STUB")"
+            [ -f "$STUB" ] || { printf '#!/bin/sh\necho "stub"\n' > "$STUB" && chmod +x "$STUB"; }
+            tar czf src-tauri/sidecar-bundle.tar.gz -C src-tauri binaries/nexe-sidecar-$TRIPLE
+            shasum -a 256 src-tauri/sidecar-bundle.tar.gz | awk '{print $1}' > src-tauri/sidecar-bundle.sha256
+          fi
+
       - name: Bundle (release, unsigned)
         run: pnpm tauri build
 
