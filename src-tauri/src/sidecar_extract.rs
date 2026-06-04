@@ -26,6 +26,22 @@
 ///
 /// Returns the `sidecar_dir` path so the caller can pass it as `NEXE_SIDECAR_DIR`
 /// to the launcher process.
+/// A `.extract.lock` older than this threshold is considered stale (left
+/// behind by a process killed mid-extraction) and is safe to remove.
+const STALE_LOCK_SECS: u64 = 300;
+
+/// Returns `true` when `lock_path` exists and its mtime is older than
+/// [`STALE_LOCK_SECS`]. Returns `false` on any I/O error or if the file is
+/// absent — the caller treats those as "not stale".
+fn is_lock_stale(lock_path: &std::path::Path) -> bool {
+    std::fs::metadata(lock_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|d| d.as_secs() > STALE_LOCK_SECS)
+        .unwrap_or(false)
+}
+
 // Dead in debug builds (called only under #[cfg(not(debug_assertions))]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
 pub(crate) fn ensure_sidecar_extracted(
@@ -80,21 +96,45 @@ pub(crate) fn ensure_sidecar_extracted(
         {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                tracing::info!(
-                    lock = %lock_path.display(),
-                    "another process is extracting the sidecar bundle; waiting"
-                );
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-                while std::time::Instant::now() < deadline {
-                    if matches!(std::fs::read_to_string(&marker), Ok(v) if v.trim() == expected) {
-                        return Ok(sidecar_dir);
+                if is_lock_stale(&lock_path) {
+                    tracing::warn!(
+                        lock = %lock_path.display(),
+                        "stale .extract.lock (>{}s); removing and retrying",
+                        STALE_LOCK_SECS
+                    );
+                    let _ = std::fs::remove_file(&lock_path);
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&lock_path)
+                    {
+                        Ok(f) => f,
+                        Err(e) => {
+                            return Err(format!(
+                                "acquire extract lock after stale removal {}: {e}",
+                                lock_path.display()
+                            ))
+                        }
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                } else {
+                    tracing::info!(
+                        lock = %lock_path.display(),
+                        "another process is extracting the sidecar bundle; waiting"
+                    );
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    while std::time::Instant::now() < deadline {
+                        if matches!(std::fs::read_to_string(&marker), Ok(v) if v.trim() == expected)
+                        {
+                            return Ok(sidecar_dir);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    return Err(format!(
+                        "timed out waiting for concurrent sidecar extraction (lock {})",
+                        lock_path.display()
+                    ));
                 }
-                return Err(format!(
-                    "timed out waiting for concurrent sidecar extraction (lock {})",
-                    lock_path.display()
-                ));
             }
             Err(e) => return Err(format!("acquire extract lock {}: {e}", lock_path.display())),
         };
@@ -431,4 +471,35 @@ mod tests {
     // The actual lock-loser polling loop is exercised end-to-end by integration
     // tests using a real AppHandle; this unit test pins the comparison contract
     // (`marker.trim() == expected`) that the loop relies on.
+
+    // ─── K-001 — stale lock detection ─────────────────────────────────────────
+
+    #[test]
+    fn stale_lock_detected_above_threshold() {
+        let root = mktemp_root("stale-lock-detect");
+        let lock_path = root.join(".extract.lock");
+        let f = std::fs::File::create(&lock_path).unwrap();
+        let old_time = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(600))
+            .unwrap();
+        f.set_modified(old_time).unwrap();
+        assert!(super::is_lock_stale(&lock_path));
+    }
+
+    #[test]
+    fn fresh_lock_not_detected_as_stale() {
+        let root = mktemp_root("fresh-lock");
+        let lock_path = root.join(".extract.lock");
+        std::fs::File::create(&lock_path).unwrap();
+        // mtime = now (just created) — well within STALE_LOCK_SECS
+        assert!(!super::is_lock_stale(&lock_path));
+    }
+
+    #[test]
+    fn missing_lock_not_stale() {
+        let root = mktemp_root("missing-lock");
+        let lock_path = root.join(".extract.lock");
+        // File does not exist — unwrap_or(false) in is_lock_stale
+        assert!(!super::is_lock_stale(&lock_path));
+    }
 }

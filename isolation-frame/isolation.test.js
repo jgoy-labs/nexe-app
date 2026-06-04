@@ -279,6 +279,60 @@ describe("Isolation filter", () => {
         expect(unallowlisted).toContain("evil_cmd");
     });
 
+    // B-001 — open_external_url: Tauri 2 payload wrapping fix.
+    describe("open_external_url (B-001)", () => {
+        it("accepts valid https URL via Tauri 2 .payload shape", () => {
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "open_external_url",
+                    payload: { url: "https://server-nexe.com" },
+                })
+            ).not.toThrow();
+        });
+
+        it("accepts valid http URL via Tauri 2 .payload shape", () => {
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "open_external_url",
+                    payload: { url: "http://server-nexe.com" },
+                })
+            ).not.toThrow();
+        });
+
+        it("accepts valid https URL via legacy flat shape (fallback)", () => {
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "open_external_url",
+                    url: "https://server-nexe.com",
+                })
+            ).not.toThrow();
+        });
+
+        it("rejects missing url in both shapes", () => {
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({ cmd: "open_external_url" })
+            ).toThrow(/https\?/);
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({ cmd: "open_external_url", payload: {} })
+            ).toThrow(/https\?/);
+        });
+
+        it("rejects non-http/https protocol", () => {
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "open_external_url",
+                    payload: { url: "ftp://example.com" },
+                })
+            ).toThrow(/https\?/);
+            expect(() =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "open_external_url",
+                    payload: { url: "javascript:alert(1)" },
+                })
+            ).toThrow(/https\?/);
+        });
+    });
+
     // Security C25 — fetch_from_sidecar: allowlist validator + defense in depth.
     // The main webview does not touch the token; Rust injects the Bearer. The Isolation
     // Hook validates URL + method + body before letting it pass to Rust.

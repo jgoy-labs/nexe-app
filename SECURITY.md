@@ -146,8 +146,8 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
   release job — no tag publishes without green checks (C08).
 - `actions/checkout persist-credentials: false` everywhere — GITHUB_TOKEN not
   dropped in `.git/config` workspace (C24).
-- Matrix covers macOS x64 + macOS arm64 + macOS Universal + Linux x64 + Linux
-  ARM64 + Windows x64 + Windows ARM64 (C23, C47, C48).
+- Matrix covers macOS arm64 + Linux x64/ARM64 + Windows x64/ARM64.
+  (macOS x64 + Universal eliminated 2026-04-23; see release.yml.)
 - `concurrency.cancel-in-progress: true` prevents double-tag race (C32).
 - SBOM dual format CycloneDX + SPDX (C33).
 - Weekly bundle smoke test (full `tauri build` with bundle) (C45).

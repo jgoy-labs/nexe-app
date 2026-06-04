@@ -67,8 +67,9 @@
         // No payload required. Removes onboarding flags + .extracted marker.
     };
     ALLOWED.open_external_url = (args) => {
-        // url must be a non-empty string starting with http:// or https://.
-        if (typeof args?.url !== "string" || !args.url.match(/^https?:\/\//)) {
+        // Tauri 2 wraps invoke() args in .payload; accept both shapes for robustness.
+        const _ext_url = args?.payload?.url ?? args?.url;
+        if (typeof _ext_url !== "string" || !_ext_url.match(/^https?:\/\//)) {
             throw new Error("isolation: open_external_url requires https?:// url");
         }
     };

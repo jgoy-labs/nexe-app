@@ -45,7 +45,7 @@ Següent: Fase 1 — Shell + UI empaquetada.
 | Node.js | 24 LTS o 25.x | `nvm install 24 --lts` |
 | pnpm | 10.x | `npm i -g pnpm@10` |
 | tauri-cli | ^2.10 | `cargo install tauri-cli --version "^2.10"` |
-| macOS | 13+ Ventura | WKWebView requirement |
+| macOS | 14+ Sonoma | WKWebView requirement |
 | Linux | WebKitGTK 4.1+ | `apt install libwebkit2gtk-4.1-dev` |
 
 ## Quickstart
@@ -66,7 +66,7 @@ cargo tauri dev   # obre finestra 800x600 + iframe plugin://rag
 
 ## Documentació
 
-- ADRs arquitectònics: `docs/adr/` (16 fitxers amb decisions fonamentals, ADRs 0001-0016)
+- ADRs arquitectònics: `docs/adr/` (18 fitxers amb decisions fonamentals, ADRs 0001-0018)
 - Contracte API v0 (exemple sidecar): `docs/api-contract-v0.md`
 - TEMPLATE.md — guia per clonar aquest starter a una nova app
 
