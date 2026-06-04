@@ -17,7 +17,8 @@ function loadIsolationWithWindow() {
     // for structural parsing (prevents userinfo bypass). In Node `URL` is
     // global, but vm contexts do not inherit it by default — we inject it
     // explicitly so the loaded code can parse URLs.
-    const context = vm.createContext({ window, URL });
+    // SEC-01: `TextEncoder` is also injected so the byte-length body check works.
+    const context = vm.createContext({ window, URL, TextEncoder });
     vm.runInContext(ISOLATION_JS, context);
     return window;
 }

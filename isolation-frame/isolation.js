@@ -148,7 +148,7 @@
             if (method !== "POST" && method !== "PUT") {
                 throw new Error("isolation: fetch_from_sidecar body only allowed for POST/PUT");
             }
-            if (body.length > 1024 * 1024) {
+            if (new TextEncoder().encode(body).length > 1024 * 1024) {
                 throw new Error("isolation: fetch_from_sidecar body too large (>1MB)");
             }
         }
