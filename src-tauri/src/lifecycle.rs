@@ -10,9 +10,20 @@
 //!   2. POST /admin/system/shutdown with Authorization: Bearer <token> ✅
 //!   3. Wait up to 1.5s for the sidecar to exit gracefully
 //!   4. kill_sidecar_child() with Unix process group SIGKILL on timeout ✅
+//!      (Windows: `taskkill /T /F` tree-kill mitigation — K-002 partial)
 //!   5. app.exit(0)
 //!
-//! Phase 2 pending: Windows Job Object equivalent for kill_sidecar_child (Unix-only now).
+//! Phase 2 pending: Windows Job Object equivalent for kill_sidecar_child.
+//! Unix uses a real process group (cmd.process_group(0) + libc::kill(-pgid)).
+//! Windows currently has NO process_group at spawn, so the forced kill relies on
+//! a `taskkill /T /F /PID` tree-walk (K-002 partial mitigation): it reaps
+//! grandchildren (Ollama, model runners) by parent-PID lineage but, unlike a Job
+//! Object, has a TOCTOU window (a grandchild re-parented to PID 1 between spawn
+//! and kill escapes the tree walk). Canonical fix: spawn the sidecar into a Job
+//! Object created with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE so the whole job dies
+//! atomically when the handle closes. That requires the `windows` crate + a new
+//! Tauri state holding the job HANDLE, and must be verified on a real Windows
+//! runner (cannot be unit-tested on the Unix CI host).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -218,6 +229,33 @@ pub(crate) fn kill_sidecar_child(mutex: &Mutex<Option<std::process::Child>>) -> 
                     pgid_real,
                     "child is not own pgrp leader (recycled or never setpgid?) — skipping group kill, falling back to child.kill()"
                 );
+            }
+        }
+        // K-002 (partial): Windows has no process_group / Job Object yet, so a
+        // bare child.kill() leaves grandchildren (Ollama, model runners) orphaned.
+        // taskkill /T walks the process tree by parent PID and /F force-kills it —
+        // a built-in command (no new crate, no raw Win32 FFI). The numeric `pid`
+        // is the spawned child's PID (not attacker-controllable), passed as a
+        // separate arg (no shell interpolation). Best-effort: errors are logged
+        // and we still fall through to child.kill()+wait() below. The full Job
+        // Object (CreateJobObject + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) remains
+        // the canonical fix — see #[cfg(windows)] note at the top of this file.
+        #[cfg(windows)]
+        {
+            match std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .output()
+            {
+                Ok(out) => tracing::info!(
+                    pid,
+                    status = ?out.status,
+                    "taskkill /T /F tree-kill issued (Windows orphan mitigation)"
+                ),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    pid,
+                    "taskkill /T /F failed — falling back to child.kill() (grandchildren may orphan)"
+                ),
             }
         }
         if let Err(e) = child.kill() {

@@ -337,12 +337,13 @@ jobs:
             exit 1
           fi
           ARTIFACT_COUNT=$(wc -l < SHA256SUMS)
-          # Minim esperat: 7 builds (macOS x64 + macOS arm64 + macOS Universal +
-          #   Linux x64 + Linux ARM64 + Windows x64 + Windows ARM64)
-          # + 2 SBOMs (CycloneDX bom.json + SPDX bom.spdx.json) = 9 total
-          # Conservador: 7 (nomes builds) per tolerar regressio parcial SBOM
-          if [ "$ARTIFACT_COUNT" -lt 7 ]; then
-            echo "ERROR: SHA256SUMS has only ${ARTIFACT_COUNT} lines (expected >=7)"
+          # 2026-04-23: matrix actual = 5 builds (macOS arm64 + Linux x64 +
+          #   Linux ARM64 + Windows x64 + Windows ARM64).
+          # + 2 SBOMs (CycloneDX bom.json + SPDX bom.spdx.json) = 7 total esperat.
+          # Conservador: llindar = 5 (nomes builds) per tolerar regressio parcial
+          # SBOM (perdre 1-2 SBOMs no fa caure el release; perdre un build si).
+          if [ "$ARTIFACT_COUNT" -lt 5 ]; then
+            echo "ERROR: SHA256SUMS has only ${ARTIFACT_COUNT} lines (expected >=5)"
             echo "Artifacts trobats:"
             cat SHA256SUMS
             exit 1

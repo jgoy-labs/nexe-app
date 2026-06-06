@@ -35,6 +35,11 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
 
 **CSP + WebView:**
 - Strict CSP: `default-src 'self'`, no inline scripts, no inline styles (C11).
+- `'unsafe-eval'` removed from production `script-src` (I-002): it had been added
+  for Vite HMR (commit 28750f2), but the `tauri.conf.json` `csp` applies only to
+  production builds (dev loads from the Vite dev server). No frontend code, no
+  production dependency, and the built `dist/` bundle use `eval()`/`new Function()`.
+  Regression guard: `src/csp.test.js` fails if `'unsafe-eval'` reappears.
 - Modern directives: `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, `frame-ancestors 'none'` (C12).
 - Per-response hardening headers: `Permissions-Policy`, `Referrer-Policy: no-referrer`,
   `Cross-Origin-Opener-Policy: same-origin`, `X-Frame-Options: SAMEORIGIN` (C51).

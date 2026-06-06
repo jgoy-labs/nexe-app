@@ -59,7 +59,7 @@ L'app viu al disc de l'usuari, però conviu amb altres processos i plugins third
 
 | Mesura | Notes |
 |---|---|
-| CSP estricta (host) | `tauri.conf.json` `script-src 'self'`, `connect-src` limitat |
+| CSP estricta (host) | `tauri.conf.json` `script-src 'self' 'unsafe-inline'`, `connect-src` limitat. `'unsafe-eval'` retirat del prod (I-002): el `csp` només s'aplica a builds de producció (dev carrega del Vite dev server) i cap codi front/dep usa `eval()`/`new Function()`. Guard: `src/csp.test.js` |
 | CSP estricta (plugin response) | `plugin_protocol_handler` |
 | Capabilities mínimes | Només `core:default` a `capabilities/default.json` |
 | Anti-traversal (canonicalize) | `resolve_plugin_path` + tests unitaris |
