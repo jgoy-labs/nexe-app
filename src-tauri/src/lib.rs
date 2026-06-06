@@ -372,11 +372,13 @@ async fn poll_sidecar_health(
         //
         // localStorage handoff: tauri://localhost (splash) and
         // http://127.0.0.1:{port} (UI) are different origins, so the splash's
-        // localStorage isn't visible here. We pass the api_key in the query
-        // string; app.js reads it on first load, persists it into the
-        // sidecar-origin localStorage, and scrubs the query param via
-        // history.replaceState. UUIDv4 keys ([0-9a-f-]) are safe in URLs;
-        // url-encoding guards against future format changes.
+        // localStorage isn't visible here. We pass the api_key in the URL
+        // fragment (#nexe_api_key=…); fragments are never sent to the server,
+        // so the key never reaches uvicorn's access log / support log (K-001).
+        // app.js reads it on first load, persists it into the sidecar-origin
+        // localStorage, and scrubs the fragment via history.replaceState.
+        // UUIDv4 keys ([0-9a-f-]) are safe in URLs; url-encoding guards
+        // against future format changes.
         let encoded_key =
             percent_encoding::utf8_percent_encode(&api_key, percent_encoding::NON_ALPHANUMERIC)
                 .to_string();
@@ -384,7 +386,7 @@ async fn poll_sidecar_health(
         // web_ui_module router (routes.py:106 `APIRouter(prefix="/ui")`).
         // Hitting `/` returns the framework JSON identity payload — which
         // the webview would render as plain text — so always target /ui/.
-        let ui_url = format!("http://127.0.0.1:{port}/ui/?nexe_api_key={encoded_key}");
+        let ui_url = format!("http://127.0.0.1:{port}/ui/#nexe_api_key={encoded_key}");
         if let Ok(url) = ui_url.parse() {
             let _ = w.navigate(url);
         } else {

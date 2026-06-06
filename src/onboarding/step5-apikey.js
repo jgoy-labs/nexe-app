@@ -157,12 +157,14 @@ export async function step5() {
     // `replace` (not `href`) so the Back button cannot return to the dead old
     // sidecar port (decided during an AI-assisted review). After the revert, target the
     // sidecar HTTP origin directly with the api_key as a percent-encoded
-    // query param — app.js picks it up on first load, persists it to the
-    // sidecar-origin localStorage, and scrubs the URL. Path is `/ui/`: the
+    // URL fragment (#) — fragments are never sent to the server, so the key
+    // never reaches uvicorn's access log (K-001). app.js picks it up on first
+    // load, persists it to the sidecar-origin localStorage, and scrubs the
+    // URL. Path is `/ui/`: the
     // web_ui_module router mounts under that prefix (routes.py:106); `/`
     // returns the framework identity JSON which the webview would render
     // as plain text.
     const encodedKey = encodeURIComponent(state.apiKey);
-    window.location.replace(`http://127.0.0.1:${nextPort}/ui/?nexe_api_key=${encodedKey}`);
+    window.location.replace(`http://127.0.0.1:${nextPort}/ui/#nexe_api_key=${encodedKey}`);
   });
 }
