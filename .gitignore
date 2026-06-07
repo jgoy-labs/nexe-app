@@ -74,7 +74,3 @@ src-tauri/personality/
 
 # Scratch local de desenvolupament (no codi font)
 dev-tools/
-
-# Local tooling output and sync state (not source)
-.muthur/
-.gitoss-sync
