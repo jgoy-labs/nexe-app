@@ -8,6 +8,27 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follo
 
 ## [Unreleased]
 
+## [1.0.6] — 2026-06-07
+
+### Security
+
+- **CSP: removed `unsafe-eval`** from the isolation frame; hardened sidecar kill/lifecycle handling.
+- **Release artifacts are now guarded by a SHA256 integrity check.**
+- API key is passed via the URL fragment instead of the query string.
+
+### Added
+
+- **Version-sync gate across 4 sources**, validated against the public repo, plus cross-platform hardening.
+- Tauri 2 isolation validator; stale-lock detection; weekly bundle smoke (sidecar placeholder, H-001).
+
+### Fixed
+
+- Body-size check now uses byte length (TextEncoder injected into the test VM).
+
+### Changed
+
+- The public `.gitignore` no longer lists internal tooling entries.
+
 ## [1.0.5] — 2026-05-29 · first public beta
 
 > **Public beta.** First public release of nexe-app. Expect rough edges; please

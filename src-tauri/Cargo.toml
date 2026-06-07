@@ -1,6 +1,6 @@
 [package]
 name = "nexe-app"
-version = "1.0.5"
+version = "1.0.6"
 description = "Tauri v2 desktop app (nexe-app starter template)"
 authors = ["Jordi Goy <jgoy@jgoy.net>"]
 edition = "2021"
