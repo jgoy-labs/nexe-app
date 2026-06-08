@@ -842,6 +842,19 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Linux GPU-less rendering fix. WebKitGTK 2.42+ (e.g. 2.52 on Ubuntu 24.04)
+    // enables DMABUF/GPU rendering by default. On machines without a working
+    // GPU/EGL stack (VMs, headless servers, some ARM setups) that path fails to
+    // initialize ("failed to create dri2 screen") and the process aborts before
+    // any window appears. Force the non-DMABUF (software-friendly) path so the
+    // app renders via CPU on GPU-less machines. Set only when the user hasn't
+    // chosen a value, so it stays overridable. Must run before any GTK/WebKit
+    // init (i.e. before `tauri::Builder`). No-op on macOS/Windows.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     // ADR-0017 (2026-04-22) — single logger pipeline. `logging::init()` configures
     // `tracing-subscriber` with stdout + file rolling daily layers
     // (`data_local_dir()/com.nexe.app/logs/`). No direct `log::set_logger` here:
