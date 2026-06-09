@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # sysinfo >=0.39 puja l'MSRV a Rust 1.95; el projecte manté rust-version=1.88
+      # (job CI dedicat). Mantenir-se a 0.38.x fins que es decideixi pujar l'MSRV.
+      - dependency-name: "sysinfo"
+        versions: [">=0.39"]
 
   - package-ecosystem: npm
     directory: /
