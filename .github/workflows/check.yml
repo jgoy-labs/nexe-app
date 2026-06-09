@@ -162,6 +162,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.88.0
 
+      # CI-H01b: 'cargo build' dispara la comprovació d'externalBin de tauri_build,
+      # que avorta si no existeix un binari sidecar (binaries/ és gitignored).
+      # Stub mínim per al triple del host — mateix patró que el job `check` (mai s'empaqueta).
+      - name: sidecar stub (CI smoke only)
+        run: |
+          mkdir -p src-tauri/binaries
+          TRIPLE=$(rustc -vV | grep '^host:' | awk '{print $2}')
+          STUB="src-tauri/binaries/nexe-sidecar-$TRIPLE"
+          if [ ! -f "$STUB" ]; then
+            printf '#!/bin/sh\necho "stub"\n' > "$STUB"
+            chmod +x "$STUB"
+          fi
+
       # CI-H01: 'cargo build' (no 'check') per cobrir també codegen/linking a MSRV 1.88.
       - name: cargo build at MSRV 1.88
         working-directory: src-tauri

@@ -121,8 +121,7 @@ pub(crate) fn ensure_sidecar_extracted(
                         lock = %lock_path.display(),
                         "another process is extracting the sidecar bundle; waiting"
                     );
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
                     while std::time::Instant::now() < deadline {
                         if matches!(std::fs::read_to_string(&marker), Ok(v) if v.trim() == expected)
                         {

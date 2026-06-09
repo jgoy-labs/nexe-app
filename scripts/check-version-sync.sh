@@ -63,7 +63,9 @@ fi
 # ---- Funcions d'extracció ----
 
 extract_package_json() {
-    python3 -c "import json; print(json.load(open('$PACKAGE_JSON'))['version'])"
+    # Llegim per stdin (no per ruta): a Windows el bash MSYS obre la ruta /d/a/...
+    # però el python3 natiu no entén rutes MSYS. stdin evita passar-li cap ruta.
+    python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" < "$PACKAGE_JSON"
 }
 
 extract_cargo_toml() {
@@ -77,7 +79,8 @@ extract_cargo_toml() {
 }
 
 extract_tauri_conf() {
-    python3 -c "import json; print(json.load(open('$TAURI_CONF'))['version'])"
+    # Vegeu extract_package_json: stdin per compatibilitat amb Windows (bash MSYS + python natiu).
+    python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" < "$TAURI_CONF"
 }
 
 extract_pyproject() {
