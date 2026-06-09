@@ -49,6 +49,22 @@ jobs:
         with:
           components: clippy, rustfmt
 
+      # externalBin (tauri.conf.json) fa que tauri_build comprovi el sidecar a CADA
+      # invocació de cargo (check/clippy/test/build), no només al tauri build smoke.
+      # Sense un binari, build.rs avorta. Stub mínim (mai s'empaqueta) ABANS del primer cargo.
+      - name: sidecar stub (CI smoke only)
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          TRIPLE=$(rustc -vV | grep '^host:' | awk '{print $2}')
+          EXT=""
+          case "$TRIPLE" in *windows*) EXT=".exe";; esac
+          STUB="src-tauri/binaries/nexe-sidecar-$TRIPLE$EXT"
+          if [ ! -f "$STUB" ]; then
+            printf '#!/bin/sh\necho "stub"\n' > "$STUB"
+            chmod +x "$STUB"
+          fi
+
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
@@ -124,18 +140,6 @@ jobs:
 
       - name: vitest
         run: pnpm test
-
-      # security audit 2026-05-06: externalBin declarat però sidecar no buildat a CI.
-      # Stub mínim per al triple de la plataforma — suficient per al smoke --no-bundle.
-      # Quan el sidecar real existeixi, substituir per build-sidecar.sh.
-      - name: sidecar stub (CI smoke only)
-        run: |
-          TRIPLE=$(rustc -vV | grep '^host:' | awk '{print $2}')
-          STUB="src-tauri/binaries/nexe-sidecar-$TRIPLE"
-          if [ ! -f "$STUB" ]; then
-            printf '#!/bin/sh\necho "stub"\n' > "$STUB"
-            chmod +x "$STUB"
-          fi
 
       # Smoke check del packaging end-to-end.
       # --no-bundle evita generar DMG/AppImage/MSI (rapid, sense artifacts).
