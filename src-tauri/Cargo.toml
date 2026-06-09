@@ -92,7 +92,7 @@ tauri-plugin-updater = { version = "2", optional = true }
 # Serde derive per HardwareInfo + CatalogModel structs als Tauri commands.
 serde = { version = "1", features = ["derive"] }
 # Hardware detection (RAM, OS, disk) per onboarding wizard.
-sysinfo = "0.35"
+sysinfo = "0.39"
 # tauri-plugin-opener: reintroduir quan Fase 3 ho requereixi per l'agent (obrir URLs externes)
 # tauri-plugin-clipboard-manager — opcional per a imatges/HTML al clipboard. Activar a Fase 1+.
 # tauri-plugin-clipboard-manager = { version = "2", optional = true }
