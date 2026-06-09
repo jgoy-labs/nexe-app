@@ -65,7 +65,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # flate2: gzip decompression (pure Rust, no system zlib). tar: archive extraction with symlink support.
 flate2 = "1"
 # Pin >= 0.4.45: RUSTSEC-2026-0067 (unpack_in symlink chmod escape) fixed in 0.4.45.
-tar = "0.4.45"
+tar = "0.4.46"
 # Tauri 2 plugins baseline (single-instance, dialog, log).
 # Tots estàndard 2026 per a qualsevol app desktop seriosa.
 # B9 (2026-04-21): `tauri-plugin-store` + `tauri-plugin-notification`
