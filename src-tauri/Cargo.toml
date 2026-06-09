@@ -84,7 +84,7 @@ tauri-plugin-dialog = "2"
 # C29: crash-report path via `dirs::data_local_dir()` (escriu a
 # `~/Library/Application Support/nexe-app/crashes/` mac, `%LOCALAPPDATA%` Win).
 # Ja és transitive dep de Tauri — afegir-lo explícit no pull més res.
-dirs = "5"
+dirs = "6"
 # Updater feature-gated: requereix pubkey de signing (per ara stub).
 # Activar amb `cargo build --features updater` quan el release pipeline sign+notarize estigui operatiu.
 tauri-plugin-updater = { version = "2", optional = true }
