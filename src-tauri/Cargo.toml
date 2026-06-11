@@ -43,7 +43,7 @@ tracing-appender = "0.2"
 percent-encoding = "2"
 # Plugin integrity (ADR-0014 actiu)
 sha2 = "0.10"
-toml = "0.8"
+toml = "1.1"
 # Bounded threadpool per evitar thread-bomb (1 thread per request).
 threadpool = "1.8"
 # LRU cap per RATE_LIMITERS i VERIFIED_PLUGINS (evita OOM si entrades per tots els IDs).
