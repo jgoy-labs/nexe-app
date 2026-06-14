@@ -39,6 +39,14 @@ if [ ! -d "$SIDECAR_SRC/python-runtime" ]; then
   exit 2
 fi
 
+# B183/B184: defensa-en-profunditat — el gate de privadesa viu a build-sidecar.sh,
+# però pre-bundle pot cridar-se sol (beforeBundleCommand de Tauri) sobre un staging
+# potencialment brut → re-verifiquem que app/ no arrossega dades de DEV/test abans
+# de segellar el tarball distribuït.
+if [ -d "$SIDECAR_SRC/app" ]; then
+    "$SCRIPT_DIR/verify-privacy-gate.sh" "$SIDECAR_SRC/app" || exit 1
+fi
+
 echo "pre-bundle-sidecar: creating sidecar-bundle.tar.gz..."
 rm -f "$TARBALL"
 # Strip macOS AppleDouble (._*) files BEFORE tarball creation. Without

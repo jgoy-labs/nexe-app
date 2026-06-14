@@ -304,6 +304,11 @@ fn spawn_sidecar_process(
     Ok(child)
 }
 
+/// Splash health-poll budget (seconds). Must not be smaller than the sidecar's
+/// own startup deadline (sidecar_extract = 120s) — otherwise the splash gives
+/// up and navigates while the sidecar is still legitimately booting (B169).
+pub(crate) const HEALTH_POLL_TIMEOUT_SECS: u64 = 120;
+
 /// Poll sidecar health endpoint and navigate to web UI when ready.
 ///
 /// After reverting to the sidecar-served UI, the sidecar serves the full UI again, so we navigate
@@ -322,11 +327,14 @@ async fn poll_sidecar_health(
     // arrencament.
     let health_url = format!("http://127.0.0.1:{port}/admin/system/health");
     let bearer = format!("Bearer {auth_token}");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(HEALTH_POLL_TIMEOUT_SECS);
     let mut elapsed = 0u32;
     loop {
         if std::time::Instant::now() > deadline {
-            tracing::warn!("splash: sidecar health timeout after 30s — navigating anyway");
+            tracing::warn!(
+                "splash: sidecar health timeout after {HEALTH_POLL_TIMEOUT_SECS}s — navigating anyway"
+            );
             break;
         }
         match client
@@ -1072,6 +1080,14 @@ mod tests {
     #[test]
     fn content_type_html() {
         assert_eq!(content_type_for("index.html"), "text/html; charset=utf-8");
+    }
+
+    #[test]
+    fn health_poll_timeout_not_less_than_startup_timeout() {
+        // B169: the splash health poll must not give up before the sidecar's
+        // own startup budget (sidecar_extract deadline = 120s). 90s is the
+        // regression floor that keeps the two in sync.
+        assert!(HEALTH_POLL_TIMEOUT_SECS >= 90);
     }
 
     #[test]

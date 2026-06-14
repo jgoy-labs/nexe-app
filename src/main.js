@@ -120,7 +120,9 @@ window.addEventListener("message", handlePluginMessage);
 // -----------------------------------------------------------------------------
 
 const HEALTH_POLL_MS = 500;
-const HEALTH_TIMEOUT_MS = 30_000;
+// B169: must not give up before the sidecar's startup budget (Rust
+// HEALTH_POLL_TIMEOUT_SECS / sidecar_extract 120s). Exported for the regression test.
+export const HEALTH_TIMEOUT_MS = 120_000;
 
 function setStatus(text) {
   const el = document.querySelector("#splash-status");

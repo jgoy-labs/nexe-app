@@ -84,16 +84,32 @@ echo "=== Verificacio notarització DMG ==="
 # Parametritzat — escanejem DMGs generats en lloc d'assumir nom.
 # Suporta qualsevol version + arch (x86_64/aarch64/universal) sense hardcoding.
 DMG_DIR="target/release/bundle/dmg"
+DMG_FAIL=0
 if [[ -d "$DMG_DIR" ]]; then
     for DMG in "$DMG_DIR"/*.dmg; do
         [[ -f "$DMG" ]] || continue
         echo "Verificant $(basename "$DMG"):"
-        spctl -a -t open --context context:primary-signature -v "$DMG" || {
-            echo "⚠️  $(basename "$DMG") no notaritzat correctament"
-        }
+        # B138: en mode estricte (release pipeline) un DMG mal notaritzat ha
+        # d'aturar el build, no només avisar — un release silenciós amb DMG no
+        # notaritzat el rebutjaria Gatekeeper a casa de l'usuari.
+        if [[ "${NEXE_STRICT_SIGNING:-0}" == "1" ]]; then
+            spctl -a -t open --context context:primary-signature -v "$DMG" || {
+                echo "❌  $(basename "$DMG") no notaritzat correctament (NEXE_STRICT_SIGNING=1)"
+                DMG_FAIL=1
+            }
+        else
+            spctl -a -t open --context context:primary-signature -v "$DMG" || {
+                echo "⚠️  $(basename "$DMG") no notaritzat correctament"
+            }
+        fi
     done
 else
     echo "⚠️  $DMG_DIR no existeix — cap DMG generat?"
+fi
+
+if [[ "$DMG_FAIL" -eq 1 ]]; then
+    echo "❌  Notarització DMG fallida en mode estricte — abortant build"
+    exit 1
 fi
 
 echo ""

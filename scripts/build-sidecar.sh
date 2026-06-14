@@ -183,6 +183,8 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         --exclude='__pycache__' --exclude='/venv' --exclude='/diari' \
         --exclude='/tests' --exclude='/InstallNexe.app' --exclude='/Nexe.app' \
         --exclude='/.test_venv' --exclude='/.venv' \
+        --exclude='/.test_data' --exclude='/worktrees' \
+        --exclude='/.github' --exclude='/.grimp_cache' --exclude='/.ruff_cache' \
         --exclude='/node_modules' --exclude='/.pytest_cache' --exclude='/.mypy_cache' \
         --exclude='/.coverage' --exclude='.DS_Store' --exclude='._*' \
         --exclude='/docs' --exclude='/specialists' \
@@ -669,6 +671,19 @@ else
     echo "    Sidecar boot log: /tmp/nexe-sidecar-boot.log (últimes 20 línies):"
     tail -20 /tmp/nexe-sidecar-boot.log 2>/dev/null
     exit 1
+fi
+
+# B082 (CRY-01): el sidecar server-nexe ha d'arrencar amb encriptació-at-rest
+# activa. La lògica viu a verify-encryption-gate.sh perquè sigui testejable
+# (test-encryption-gate.sh). Camí POC (APP_SOURCE_DIR buit) → se salta net.
+"$SCRIPT_DIR/verify-encryption-gate.sh" "$APP_SOURCE_DIR" /tmp/nexe-sidecar-boot.log || exit 1
+
+# B183/B184: el sidecar staged no ha d'arrossegar dades de DEV/test (.test_data,
+# worktrees/, storage/ runtime, *.db de memòria). Gate determinista i testejable
+# (test-privacy-gate.sh) — última xarxa abans d'empaquetar; complementa els
+# excludes del rsync (Step 4) i el rm -rf app/storage de dalt.
+if [ -d "$SIDECAR_DIR/app" ]; then
+    "$SCRIPT_DIR/verify-privacy-gate.sh" "$SIDECAR_DIR/app" || exit 1
 fi
 
 # ── Step 8: Report ────────────────────────────────────────────────────

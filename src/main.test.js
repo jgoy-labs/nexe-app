@@ -346,3 +346,9 @@ describe("plugin firewall — iframe contentWindow race", () => {
     // an exploit vector (reason: H3).
   });
 });
+
+describe("sidecar health timeout (B169)", () => {
+  it("does not give up before the sidecar startup budget", () => {
+    expect(mod.HEALTH_TIMEOUT_MS).toBeGreaterThanOrEqual(90_000);
+  });
+});
