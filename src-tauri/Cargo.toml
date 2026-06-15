@@ -48,7 +48,7 @@ toml = "1.1"
 threadpool = "1.8"
 # LRU cap per RATE_LIMITERS i VERIFIED_PLUGINS (evita OOM si entrades per tots els IDs).
 # 0.17 és versió patched del RUSTSEC-2026-0002 (IterMut unsound — no afecta get/put/peek que usem)
-lru = "0.17"
+lru = "0.18"
 # serde_json necessari pel tauri::generate_context! macro quan hi ha secció "plugins".
 serde_json = "1"
 # UUID v4 per session token (128 bits entropia, no re-usable cross-start).
