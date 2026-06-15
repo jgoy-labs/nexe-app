@@ -42,7 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 percent-encoding = "2"
 # Plugin integrity (ADR-0014 actiu)
-sha2 = "0.10"
+sha2 = "0.11"
 toml = "1.1"
 # Bounded threadpool per evitar thread-bomb (1 thread per request).
 threadpool = "1.8"
