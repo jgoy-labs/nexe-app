@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# check-audit-dates.sh — Verifica que cap review-date del audit.toml ha passat.
-# C18: audit.toml 19 CVEs ignorats sense expiració automàtica.
+# check-audit-dates.sh — Verifies that no review-date in audit.toml has passed.
+# C18: audit.toml 19 CVEs ignored without automatic expiry.
 # Usage: ./scripts/check-audit-dates.sh
-# Exit 1 si alguna review-date ha passat (cal revisar els ignores).
+# Exit 1 if any review-date has passed (the ignores need review).
 #
 # B20: Current limitation — all 19 CVE ignores share a single review-date (2026-10-01).
 # This means every CVE expires on the same day, making early partial reviews impossible

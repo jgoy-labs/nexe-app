@@ -1,12 +1,12 @@
-# ADR-0014: Plugin integrity — SHA-256 ACTIU
+# ADR-0014: Plugin integrity — SHA-256 ACTIU (Sprint 0.15)
 
-**Date:** 2026-04-18 (v1) / 2026-04-21 (v2 C01 fix) / 2026-04-21 (v3 B5 atomic snapshot)
-**Status:** Accepted — **Active** (atomic snapshot verify+load, v0.1.2-fase0-v2)
+**Date:** 2026-04-18 (v1 Sprint 0.15) / 2026-04-21 (v2 C01 fix) / 2026-04-21 (v3 B5 atomic snapshot)
+**Status:** Accepted — **Active** (Sprint 0.18, atomic snapshot verify+load, v0.1.2-fase0-v2)
 **Decided by:** Jordi Goy
-**Previous status:** stub / deferred
+**Previous status:** stub / deferred (Sprint 0.14 #T6)
 **Revisions:**
-- **v2 2026-04-21** — TOCTOU mtime cache bypass detectat per una revisió adversarial assistida per IA (finding C01, amb verificació empírica APFS). L'algoritme original basat en `CacheEntry { mtime: SystemTime }` era bypassable per edició in-place d'un fitxer existent (dir mtime no canvia). Substituït per re-hash a cada request.
-- **v3 2026-04-21** — TOCTOU **verify→serve double-read** detectat per una revisió adversarial assistida per IA (finding B5, PoC empíric **70.5% hit-rate**). El fix v2 tapava el TOCTOU cache però deixava obert un segon TOCTOU: el handler feia `verify_plugin_integrity` (lectura 1 del FS per hashar) i després `File::open + read_to_end` (lectura 2 per servir). Un atacant local amb write access a `plugins-dev/<id>/` podia substituir contingut entre les dues lectures → el serve retornava bytes diferents dels que havien passat el hash. **Substituït per "atomic snapshot via open fd"**: la nova funció `verify_and_load_plugin_asset` obre TOTS els fds del plugin abans de qualsevol read, llegeix des dels fds (Unix garanteix inode viva contra rename/unlink/write externs), hasha des del snapshot en memòria, i retorna els bytes del fitxer requested DES DEL MATEIX snapshot. Els bytes servits són, per invariant, els bytes que van passar el hash. Verificat amb mutation test empíric (pattern pre-fix reintroduït → test detecta 251/500 bypasses; pattern post-fix → 0/500).
+- **v2 2026-04-21** — TOCTOU mtime cache bypass detectat per auditoria AAA+++ (finding C01 consolidat, 3/3 IAs + verificació empírica APFS). L'algoritme original basat en `CacheEntry { mtime: SystemTime }` era bypassable per edició in-place d'un fitxer existent (dir mtime no canvia). Substituït per re-hash a cada request.
+- **v3 2026-04-21 Sprint 0.18** — TOCTOU **verify→serve double-read** detectat per red team (finding B5 consolidat, únic external red team extern, PoC empíric **70.5% hit-rate**). El fix v2 tapava el TOCTOU cache però deixava obert un segon TOCTOU: el handler feia `verify_plugin_integrity` (lectura 1 del FS per hashar) i després `File::open + read_to_end` (lectura 2 per servir). Un atacant local amb write access a `plugins-dev/<id>/` podia substituir contingut entre les dues lectures → el serve retornava bytes diferents dels que havien passat el hash. **Substituït per "atomic snapshot via open fd"**: la nova funció `verify_and_load_plugin_asset` obre TOTS els fds del plugin abans de qualsevol read, llegeix des dels fds (Unix garanteix inode viva contra rename/unlink/write externs), hasha des del snapshot en memòria, i retorna els bytes del fitxer requested DES DEL MATEIX snapshot. Els bytes servits són, per invariant, els bytes que van passar el hash. Verificat amb mutation test empíric (pattern pre-fix reintroduït → test detecta 251/500 bypasses; pattern post-fix → 0/500).
 
 ## Context
 
@@ -20,9 +20,9 @@ The `plugin://` URI scheme (ADR-0009) serves arbitrary files under `<plugins_roo
 
 1. **Hash target:** the entire plugin folder (`<plugins_root>/<plugin_id>/`), not just `ui/`. This protects the manifest, icons, and any auxiliary files.
 2. **Manifest canonicalization:** when hashing `manifest.toml`, the `[integrity]` section is stripped and the TOML is re-serialized canonically. This breaks the hash↔manifest circularity (the hash cannot depend on itself).
-3. **Feature flag:** `STRICT_INTEGRITY: bool = true` at the top of `src-tauri/src/integrity.rs` (`cfg(not(debug_assertions))`). Dev builds short-circuit to `Ok(())` to avoid friction each edit; release builds enforce hash match.
+3. **Feature flag:** `STRICT_INTEGRITY: bool = true` at the top of `src-tauri/src/integrity.rs` (`cfg(not(debug_assertions))`). Dev builds short-circuit to `Ok(())` to avoid friction each edit (F024); release builds enforce hash match.
 4. **No invalidation cache on the decision path.** `VERIFIED_PLUGINS: LruCache<String, CacheEntry { known_hash }>` now stores the last successful hash **exclusively for observability** (logs, metrics, future fingerprint ADR). The verifier never consults the cache before re-hashing; a stale cache cannot serve a tampered plugin.
-5. **Failed verifications are not cached** — transient errors self-recover on the next request.
+5. **Failed verifications are not cached** (F007 preserved) — transient errors self-recover on the next request.
 
 ### Why re-hash every request (C01 rationale)
 
@@ -30,9 +30,9 @@ The previous algorithm used `CacheEntry { mtime: SystemTime }` with `plugin_dir_
 
 - **POSIX semantics:** `stat(2)` of a directory only updates `mtime` when entries are added, removed, or renamed. Editing the **contents** of an existing child file does not touch the parent dir's mtime.
 - **Attack vector:** a local adversary with write access to `plugins/<id>/ui/*.html` could tamper with a previously verified plugin; on the next `plugin://` request, the cache saw the old mtime unchanged and served the manipulated bytes without re-hashing.
-- **Cost analysis:** a typical plugin is <2 MB; SHA-256 on a modern CPU runs at ~500 MB/s → ~4 ms per plugin even at the bound, commonly <1 ms. The promised "O(1) after first request" saved well under 10 ms per request but broke the tamper-evidence promise. For a security-focused starter framework, this trade is unacceptable.
+- **Cost analysis:** a typical plugin is <2 MB; SHA-256 on a modern CPU runs at ~500 MB/s → ~4 ms per plugin even at the bound, commonly <1 ms. The promised "O(1) after first request" saved well under 10 ms per request but broke the tamper-evidence promise. For a starter framework that promises strong tamper-evidence, this trade is unacceptable.
 
-### Why atomic snapshot verify+load (B5 rationale)
+### Why atomic snapshot verify+load (B5 rationale — Sprint 0.18)
 
 The v2 fix re-hashed every request but kept `verify` and `serve` as two separate FS reads:
 
@@ -44,7 +44,7 @@ let bytes = std::fs::read(&canon_file)?;                     // Read 2: serves
 return build_response(bytes);
 ```
 
-An AI-assisted adversarial review (2026-04-21) crafted a spin-write attacker thread that alternated the file's content between "benign" and "malicious" at microsecond intervals. Over 556 requests, **392 (70.5%)** returned malicious bytes that the hash had **not** just verified. The attacker simply had to keep writing; the verify→serve gap was ~µs but reachable by any concurrent writer.
+External red team (2026-04-21) crafted a spin-write attacker thread that alternated the file's content between "benign" and "malicious" at microsecond intervals. Over 556 requests, **392 (70.5%)** returned malicious bytes that the hash had **not** just verified. The attacker simply had to keep writing; the verify→serve gap was ~µs but reachable by any concurrent writer.
 
 The v3 algorithm closes this by reading **once** under an atomic snapshot:
 
@@ -70,7 +70,7 @@ return Ok(contents.find(requested_rel_path)?.bytes);
 
 **Invariant:** the bytes returned are **byte-for-byte identical** to the bytes that produced the hash. Any tampering during walk causes the hash to mismatch; any tampering between open and read is absorbed by the fd's inode-pinning (Unix) or by `File::open`'s default sharing mode (Windows). No intermediate read of the FS occurs between verify and serve.
 
-**Cost:** the snapshot reads every file once (same I/O as the old verify). The handler no longer re-opens the requested file — net I/O is identical. Memory cost: all plugin bytes held transiently during the snapshot; bounded by `MAX_HASH_FILE_BYTES = 10 MB` per file and `MAX_HASH_TOTAL_BYTES = 50 MB` combined (B6).
+**Cost:** the snapshot reads every file once (same I/O as the old verify). The handler no longer re-opens the requested file — net I/O is identical. Memory cost: all plugin bytes held transiently during the snapshot; bounded by `MAX_HASH_FILE_BYTES = 10 MB` per file and `MAX_HASH_TOTAL_BYTES = 50 MB` combined (B6 Sprint 0.18).
 
 **Mutation test (release-only):** `b5_verify_and_load_atomic_snapshot_no_bypass` spawns a spin-write attacker, issues 500 verify+load requests, and asserts **zero** returns with bytes mismatching the hash. Re-introducing the pre-fix pattern (separate verify + separate read with a 100 µs sleep) causes the test to fail with 251/500 bypasses — confirming the test is not theater.
 
@@ -174,10 +174,10 @@ toml = "0.8"
 - Observability cache still emits `tracing::debug!` when a plugin's known_hash rotates — useful for detecting accidental drift between `manifest.toml` and disk in dev, or post-update in release.
 
 ### Negatives
-- **~10 ms per request latency** (SHA-256 of a <2 MB plugin on modern CPU, commonly <5 ms). Mitigations: plugins are served by an 8-thread bounded pool so concurrent verifies parallelize; requests on the hot path (`/ui/index.html` first load) amortize well under typical Wi-Fi round-trips.
+- **~10 ms per request latency** (SHA-256 of a <2 MB plugin on modern CPU, commonly <5 ms). Mitigations: plugins are served by an 8-thread bounded pool (S03 F004) so concurrent verifies parallelize; requests on the hot path (`/ui/index.html` first load) amortize well under typical Wi-Fi round-trips.
 - **Memory cost transient during snapshot.** v3 holds every plugin file's bytes in memory until hash+verify+serve completes. `MAX_HASH_FILE_BYTES = 10 MB` per file and `MAX_HASH_TOTAL_BYTES = 50 MB` per plugin cap the worst case. A plugin with 500 × 100 KB assets would allocate ~50 MB briefly per GET; a plugin with one 20 MB file is rejected (413).
-- Build/bundle step must recompute the hash when plugins change, or verification fails on the next request. Mitigated by `scripts/compute-plugin-hash.sh` and a future CI step.
-- Transient errors are **not** cached — a plugin with a temporarily unreadable manifest will re-attempt on the following request and self-heal when the FS settles.
+- Build/bundle step must recompute the hash when plugins change, or verification fails on the next request. Mitigated by `scripts/compute-plugin-hash.sh` (run manually). **Status (2026-06):** the "future CI step" verifying plugin hashes vs manifest was never wired into the workflows; the real enforcement is at runtime (SHA-256 per GET → mismatch = 403), so such a CI step would be DX/early-warning only, not a security gate.
+- Transient errors are **not** cached (F007) — a plugin with a temporarily unreadable manifest will re-attempt on the following request and self-heal when the FS settles.
 - **Operational note:** no cache means there is no "restart required" for a legitimate plugin update in release — editing the plugin files and the matching `manifest.toml` in lockstep is enough. This changes the recovery story relative to v1 of this ADR.
 
 ## Workflow when a plugin changes

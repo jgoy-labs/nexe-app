@@ -2,15 +2,14 @@
 
 **App Desktop OSS per server-nexe.**
 
-Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i la UI web existent. Afegeix agent navegador (Playwright+Chromium), sistema visual de plugins i distribució DMG/AppImage.
+Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i la UI web existent. Afegeix sistema visual de plugins i distribució DMG/AppImage.
 
 ## Principis
 
 - **Thin shell / thick backend:** Tauri = finestra + permisos + lifecycle. Tota la lògica a server-nexe.
 - **Sidecar empaquetada:** Release → server-nexe dins l'app. Dev → server-nexe extern.
-- **Navegador desacoblat:** Chromium gestionat per Playwright al backend, MAI al webview de Tauri.
 - **IPC híbrid:** HTTP/WS per dades IA, Tauri Commands per funcions natives.
-- **Zero cloud:** Tot local, zero dependències externes obligatòries.
+- **Offline-first:** Funciona en local un cop instal·lat; algunes funcions (baixar models, catàleg de models i token Hugging Face) requereixen xarxa al primer ús.
 
 ## Stack
 
@@ -20,10 +19,9 @@ Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i
 | Frontend | HTML/CSS/JS vanilla existent |
 | Node tooling | Node.js 24 LTS + pnpm 10 |
 | Backend | Python 3.11+ + FastAPI + Uvicorn |
-| Empaquetament | venv relocatable via `build-python-bundle.sh` |
+| Empaquetament | venv relocatable via `build-sidecar.sh` |
 | Vector DB | Qdrant |
 | LLM | Ollama |
-| Agent browser | Playwright Python + Chromium |
 | Packaging | DMG signat/notaritzat · AppImage |
 
 ## Plataformes
@@ -33,9 +31,7 @@ Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i
 
 ## Estat
 
-**Fase 0 ✅ COMPLETA** (2026-04-17) — sanejament pre-Fase 1 (2026-04-18).
-
-Següent: Fase 1 — Shell + UI empaquetada.
+**v1.0.6** — Fases 1-6 completes: shell Tauri + UI empaquetada, onboarding, catàleg de models, token Hugging Face i distribució DMG/AppImage.
 
 ## Prerequisits (macOS + Linux)
 
@@ -55,18 +51,12 @@ git clone <repo>
 cd nexe-app
 pnpm install
 cd src-tauri && cargo check
-cargo tauri dev   # obre finestra 800x600 + iframe plugin://rag
+cargo tauri dev   # obre finestra 1024x768 (devUrl http://localhost:1420)
 ```
-
-## Estimació
-
-- MVP (Fases 0-2): 5-7 setmanes
-- v1 complet (Fases 0-5): 14-18 setmanes (1 dev + IA)
-- v2 multimèdia (Fase 6): +4-6 setmanes
 
 ## Documentació
 
-- ADRs arquitectònics: `docs/adr/` (18 fitxers amb decisions fonamentals, ADRs 0001-0018)
+- ADRs arquitectònics: `docs/adr/` (19 fitxers amb decisions fonamentals, ADRs 0001-0018 + 0021)
 - Contracte API v0 (exemple sidecar): `docs/api-contract-v0.md`
 - TEMPLATE.md — guia per clonar aquest starter a una nova app
 
@@ -75,5 +65,5 @@ cargo tauri dev   # obre finestra 800x600 + iframe plugin://rag
 | Repo | Rol |
 |---|---|
 | `server-nexe` | Core API (sidecar empaquetada) |
-| `plugins-nexe` | Plugins comunitaris (obert a PRs) |
+| `plugins-nexe` | Plugins (arquitectura modular) |
 | **`nexe-app`** | Shell Tauri + distribució |

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# compute-plugin-hash.sh — Calcula el SHA-256 d'un plugin segons ADR-0014.
-# Us: ./scripts/compute-plugin-hash.sh <plugin_dir>
-# Exemple: ./scripts/compute-plugin-hash.sh plugins-dev/rag
+# compute-plugin-hash.sh — Computes the SHA-256 of a plugin per ADR-0014.
+# Usage: ./scripts/compute-plugin-hash.sh <plugin_dir>
+# Example: ./scripts/compute-plugin-hash.sh plugins-dev/rag
 #
-# Copia l'output al camp `[integrity].sha256` del manifest.toml del plugin.
+# Copy the output into the `[integrity].sha256` field of the plugin's manifest.toml.
 
 set -euo pipefail
 

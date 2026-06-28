@@ -41,6 +41,12 @@ microphone = false
 comfyui = false
 ```
 
+> **Estat d'implementació (2026-06):** aquest schema estès del `manifest.toml`
+> (`[ui]` / `trust` / `[desktop]` / `[requires]`) **encara NO està implementat**.
+> El Rust (`src-tauri/src/`) només parseja `[plugin]` i `[integrity]`; els tres
+> nivells de confiança i les capabilities `[desktop]`/`[requires]` són disseny
+> acceptat, pendent d'implementar (vegeu B056/B176). La decisió segueix vigent.
+
 ## Alternatives considerades
 
 | Opció | Motiu descart |

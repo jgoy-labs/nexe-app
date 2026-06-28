@@ -1,8 +1,13 @@
 # ADR-0004: Arquitectura interna (thin shell / thick backend)
 
 **Data:** 2026-04-17
-**Estat:** Accepted
+**Estat:** Superseded by ADR-0021 (clàusula "NO servir la UI via localhost") — 2026-06-28
 **Decidit per:** Jordi Goy
+
+> **Nota (2026-06-28, B175):** la clàusula "NO servir la UI via localhost" (Decisió + taula
+> d'alternatives) es va **revertir el 2026-05-21**: la UI la serveix el sidecar via loopback
+> (`http://127.0.0.1:{port}/ui/`). Vegeu [ADR-0021](ADR-0021-ui-served-via-loopback.md) per la
+> decisió real i les mitigacions. La resta d'aquest ADR (thin shell / thick backend) segueix vigent.
 
 ## Context
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# reproducible-build.sh — Build del binari release amb flags de reproducibilitat (ADR-0015).
+# reproducible-build.sh — Builds the release binary with reproducibility flags (ADR-0015).
 #
-# Inclou:
-#   - SOURCE_DATE_EPOCH (timestamp del HEAD commit) → evita build timestamps variables
-#   - CARGO_INCREMENTAL=0                           → no caches incrementals no-deterministes
-#   - --remap-path-prefix  $HOME, $CARGO_HOME      → no builder FS paths al binari
+# Includes:
+#   - SOURCE_DATE_EPOCH (HEAD commit timestamp) → avoids variable build timestamps
+#   - CARGO_INCREMENTAL=0                        → no non-deterministic incremental caches
+#   - --remap-path-prefix  $HOME, $CARGO_HOME   → no builder FS paths in the binary
 #
-# NO construeix el bundle (.app/.dmg/.AppImage) — aquests NO són bit-for-bit reproduïbles
-# sense upstream support a Tauri (timestamps Info.plist, code-sign, etc.).
+# Does NOT build the bundle (.app/.dmg/.AppImage) — those are NOT bit-for-bit reproducible
+# without upstream support in Tauri (Info.plist timestamps, code-sign, etc.).
 #
-# Us:
+# Usage:
 #   ./scripts/reproducible-build.sh              # cargo clean + cargo build --release
 #   ./scripts/reproducible-build.sh --no-clean   # skip cargo clean (faster, but second run
 #                                                #   reuses cache → hashes match trivially,
@@ -21,10 +21,10 @@
 # truly reproducible. Use --no-clean only for speed during development, never to claim
 # reproducibility across separate environments.
 #
-# Verificació manual:
+# Manual verification:
 #   ./scripts/reproducible-build.sh && HASH1=$(cat /tmp/nexe-build.hash)
 #   ./scripts/reproducible-build.sh && HASH2=$(cat /tmp/nexe-build.hash)
-#   [[ "$HASH1" == "$HASH2" ]] && echo "✅ reproduïble" || echo "❌ divergeix"
+#   [[ "$HASH1" == "$HASH2" ]] && echo "✅ reproducible" || echo "❌ differs"
 
 set -euo pipefail
 
@@ -41,16 +41,16 @@ done
 
 cd "$(dirname "$0")/.."
 
-# SOURCE_DATE_EPOCH: timestamp del HEAD commit (fallback: now si no hi ha git).
+# SOURCE_DATE_EPOCH: HEAD commit timestamp (fallback: now if there is no git).
 SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD 2>/dev/null || date +%s)"
 export SOURCE_DATE_EPOCH
 
-# No caches incrementals (poden introduir no-determinisme entre builds).
+# No incremental caches (they can introduce non-determinism between builds).
 export CARGO_INCREMENTAL=0
 
-# Remap absolut → placeholders (tapats als panic traces i DWARF).
-# Nota: config.toml té --remap-path-prefix=@CARGO_HOME=@cargo amb token literal;
-# aquí injectem el valor real per si no està a PATH. Additiu amb RUSTFLAGS previ.
+# Remap absolute → placeholders (masked in panic traces and DWARF).
+# Note: config.toml has --remap-path-prefix=@CARGO_HOME=@cargo with a literal token;
+# here we inject the real value in case it is not on PATH. Additive with prior RUSTFLAGS.
 CARGO_HOME_VAL="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTFLAGS="--remap-path-prefix=${HOME}=~ --remap-path-prefix=${CARGO_HOME_VAL}=@cargo ${RUSTFLAGS:-}"
 
@@ -77,7 +77,7 @@ fi
 
 cargo build --release --locked "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
 
-# Hash del binari principal (pot ser diferent amb --bin)
+# Hash of the main binary (may differ with --bin)
 BIN="target/release/nexe-app"
 if [[ -f "$BIN" ]]; then
     if command -v shasum &>/dev/null; then

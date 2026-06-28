@@ -115,6 +115,16 @@ jobs:
         working-directory: src-tauri
         run: cargo test --locked
 
+      # B055: els tests d'integritat de plugins que verifiquen el camí ESTRICTE
+      # (STRICT_INTEGRITY=true, rebuig 403 de plugins manipulats) estan gated rere
+      # #[cfg(not(debug_assertions))] i NOMÉS es compilen/corren en release. El job
+      # anterior (`cargo test --locked`, debug) no els exercita mai → el mecanisme
+      # anti-tampering de la cadena de plugins no tenia cap xarxa de seguretat de
+      # test al camí que realment s'executa en producció. Aquest job els corre.
+      - name: cargo test (release — integrity gated tests, B055)
+        working-directory: src-tauri
+        run: cargo test --release --locked
+
       - name: cargo audit (vulnerability scan)
         working-directory: src-tauri
         run: cargo audit --deny warnings

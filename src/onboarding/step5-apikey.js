@@ -148,8 +148,11 @@ export async function step5() {
       return;
     }
 
-    // ── Phase C — persist api_key + mark wizard complete ─────────────────────
-    localStorage.setItem("nexe_api_key", state.apiKey);
+    // ── Phase C — mark wizard complete ───────────────────────────────────────
+    // NB: the api_key is NOT persisted to this (wizard) origin's localStorage —
+    // it travels in the URL fragment below (Phase D) and app.js persists it to
+    // the sidecar origin. A write here would land in an abandoned origin store
+    // that nothing reads.
     await invoke("mark_onboarding_complete");
     localStorage.removeItem("nexe_onboarding_state");
 

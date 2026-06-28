@@ -133,8 +133,8 @@ fn spawn_sidecar_process(
     api_key: &str,
     stdout_log_path: Option<&std::path::Path>,
 ) -> Result<std::process::Child, String> {
-    // Assegurar subcarpetes sidecar_data_dir existents abans
-    // del spawn (logs, data, cache, vectors) — runner.py les espera.
+    // Ensure the sidecar_data_dir subfolders exist before
+    // the spawn (logs, data, cache, vectors) — runner.py expects them.
     if let Some(dir) = sidecar_data_dir {
         for sub in &["logs", "data", "cache", "vectors"] {
             let p = dir.join(sub);
@@ -166,24 +166,25 @@ fn spawn_sidecar_process(
             "NEXE_APPROVED_MODULES",
             "security,memory,rag,embeddings,mlx_module,llama_cpp_module,ollama_module,web_ui_module",
         )
-        // web_ui_module enabled to expose /ui/* JSON endpoints
-        // (info/backends/sessions/chat). HTML/static routes skipped in sidecar
-        // mode by routes.py conditional; Tauri webview serves its own UI.
+        // web_ui_module enabled to expose /ui/* endpoints (info/backends/
+        // sessions/chat) AND the web UI itself: the Tauri webview navigates to
+        // the sidecar's loopback http://127.0.0.1:{port}/ui/ (revert 2026-05-21;
+        // ADR-0021 supersedes ADR-0004's "no UI via localhost").
         // Net env contamination — scrub inherited env vars
         .env_remove("NEXE_AUTH_TOKEN")
-        .env_remove("NEXE_ADMIN_API_KEY")            // evita que una var heretada de l'entorn sobreescrigui la clau primària
+        .env_remove("NEXE_ADMIN_API_KEY")            // prevents an env var inherited from the environment from overwriting the primary key
         .env_remove("NEXE_DEV_MODE")
         .env_remove("NEXE_DEV_MODE_ALLOW_REMOTE")
         .env_remove("PYTHONPATH")
         .env_remove("VIRTUAL_ENV")
         .env_remove("DYLD_LIBRARY_PATH")
         .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
-        // Linux portability: equivalents Linux del scrub
-        // DYLD_* macOS. Si l'usuari té LD_LIBRARY_PATH/LD_PRELOAD/LD_AUDIT al
-        // shell que llança l'AppImage, el sidecar Python heretaria injecció
-        // de .so arbitràries (vector classic per hooking glibc). Defensiu
-        // cross-platform: env_remove és no-op si la var no està set, sense
-        // cost a macOS.
+        // Linux portability: Linux equivalents of the macOS DYLD_*
+        // scrub. If the user has LD_LIBRARY_PATH/LD_PRELOAD/LD_AUDIT in the
+        // shell that launches the AppImage, the Python sidecar would inherit
+        // arbitrary .so injection (classic glibc hooking vector). Defensive
+        // cross-platform: env_remove is a no-op if the var is not set, with no
+        // cost on macOS.
         .env_remove("LD_LIBRARY_PATH")
         .env_remove("LD_PRELOAD")
         .env_remove("LD_AUDIT")
@@ -244,13 +245,13 @@ fn spawn_sidecar_process(
             "NEXE_QDRANT_PATH",
             dir.join("vectors").to_string_lossy().to_string(),
         );
-        // Pin cwd to sidecar app dir. Sense això, el child Python hereta
-        // el cwd del Tauri parent (que en producció pot ser qualsevol carpeta
-        // segons com s'arrenqui l'app). El `_find_initial_config` del module
-        // manager fa `validate_safe_path(config_path, Path.cwd())` i si el cwd
-        // és arbitrari, rebutja el path productiu i cau en un fallback que
-        // resol mòduls amb paths absoluts erroniant tot el plugin loading.
-        // Pinning cwd = NEXE_HOME garanteix paths estables.
+        // Pin cwd to sidecar app dir. Without this, the Python child inherits
+        // the cwd of the Tauri parent (which in production can be any folder
+        // depending on how the app is launched). The module manager's
+        // `_find_initial_config` calls `validate_safe_path(config_path, Path.cwd())`
+        // and if the cwd is arbitrary, it rejects the production path and falls into
+        // a fallback that resolves modules with absolute paths, breaking plugin loading.
+        // Pinning cwd = NEXE_HOME guarantees stable paths.
         cmd.current_dir(dir.join("app"));
     }
     // Propagate user models dir if ~/models/ exists.
@@ -322,9 +323,9 @@ async fn poll_sidecar_health(
     api_key: String,
     client: reqwest::Client,
 ) {
-    // Endpoint real exposat per server-nexe (system.py:246). El previ
-    // `/api/v1/system/health` no existia → fallback timeout 30s al primer
-    // arrencament.
+    // Actual endpoint exposed by server-nexe (system.py:246). The previous
+    // `/api/v1/system/health` did not exist → 30s fallback timeout on first
+    // startup.
     let health_url = format!("http://127.0.0.1:{port}/admin/system/health");
     let bearer = format!("Bearer {auth_token}");
     let deadline =
@@ -403,7 +404,7 @@ async fn poll_sidecar_health(
     }
 }
 
-/// Obre un fitxer o carpeta amb l'aplicació associada del sistema operatiu.
+/// Opens a file or folder with the operating system's associated application.
 ///
 /// macOS: `open <path>` — for `.log` files, macOS launches Console.app by
 /// default (integrated auto-tail), matching the original Python tray
@@ -562,7 +563,7 @@ async fn wait_for_sidecar_health(
 /// Sequence (helpers extracted 2026-05-30):
 ///   1. Acquire restart guard (atomic swap).
 ///   2. Look up state ([`lookup_restart_state`]).
-///   3. Kill current sidecar via `kill_sidecar_child` (POST shutdown + grace + SIGKILL).
+///   3. Graceful POST /admin/system/shutdown, then kill via `kill_sidecar_child` (SIGKILL backstop).
 ///   4. Reserve a fresh ephemeral port.
 ///   5. Spawn + register the new sidecar ([`spawn_and_register_child`]).
 ///   6. Poll `/admin/system/health` up to 30s ([`wait_for_sidecar_health`]);
@@ -582,8 +583,12 @@ async fn restart_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
     let old_port = ctx.port_state.get();
     tracing::info!(old_port, "restart_sidecar: killing current sidecar");
 
-    // Graceful kill (POST /shutdown + grace + SIGKILL of pgrp). The returned
-    // PID (if any) is purely informational here.
+    // B168: graceful POST /admin/system/shutdown BEFORE the hard kill, matching
+    // graceful_quit and kill_sidecar_child's documented contract. ctx holds the
+    // api_key + http_client resolved before the kill; the old sidecar shares this
+    // api_key. Best-effort — kill_sidecar_child still SIGKILLs as the backstop.
+    crate::lifecycle::post_sidecar_shutdown(old_port, &ctx.api_key, &ctx.http_client).await;
+    // The returned PID (if any) is purely informational here.
     let _killed_pid = crate::lifecycle::kill_sidecar_child(&ctx.child_state.0);
 
     let new_port =
@@ -654,9 +659,9 @@ fn setup_services(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         })?,
     );
 
-    // Pas 0: si tenim sidecar_data_dir (release), capturem stdout/stderr a
-    // <data_dir>/logs/sidecar-stdout.log perquè el tray pugui obrir-lo amb
-    // Console.app (macOS associa `.log` per defecte) i veure pre-logger crashes.
+    // Step 0: if we have sidecar_data_dir (release), capture stdout/stderr to
+    // <data_dir>/logs/sidecar-stdout.log so the tray can open it with
+    // Console.app (macOS associates `.log` by default) and see pre-logger crashes.
     let sidecar_stdout_log: Option<std::path::PathBuf> = sidecar_data_dir
         .as_ref()
         .map(|d| d.join("logs").join("sidecar-stdout.log"));
@@ -719,8 +724,8 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "Show nexe-app", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "hide", "Hide nexe-app", true, None::<&str>)?;
     let sep_logs = PredefinedMenuItem::separator(app)?;
-    // Pas 0 (tray logs viewer) — recupera el comportament del Python tray original
-    // (installer/tray.py:540 _open_logs) que obria el server.log amb Console.app.
+    // Step 0 (tray logs viewer) — restores the behaviour of the original Python tray
+    // (installer/tray.py:540 _open_logs) that opened server.log with Console.app.
     let open_log = MenuItem::with_id(
         app,
         "open_sidecar_log",
@@ -795,6 +800,11 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
                     if let Some(parent) = state.0.parent() {
                         let _ = open_in_system(parent);
                     }
+                } else {
+                    // B170: symmetric to open_sidecar_log — in dev mode SidecarLogPath
+                    // is not registered, so both tray items are no-ops; warn instead of
+                    // failing silently.
+                    tracing::warn!("open_logs_folder: SidecarLogPath state not registered (dev mode?)");
                 }
             }
             "uninstall" => {
@@ -810,8 +820,37 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
                         .buttons(MessageDialogButtons::OkCancel)
                         .blocking_show();
                     if confirmed {
-                        crate::onboarding_cmd::full_uninstall(&app);
-                        tracing::info!("uninstall complete — exiting");
+                        // B058: kill the sidecar FIRST so it cannot keep writing
+                        // to storage/vectors/models while we delete them (SQLite/
+                        // Qdrant corruption, or files re-created racing the wipe).
+                        if let Some(state) = app.try_state::<crate::SidecarChild>() {
+                            crate::lifecycle::kill_sidecar_child(&state.0);
+                        }
+                        // B058: report failures instead of the old unconditional
+                        // "uninstall complete" — tell the user the truth.
+                        let report = crate::onboarding_cmd::full_uninstall(&app);
+                        if report.all_ok() {
+                            tracing::info!("uninstall complete — exiting");
+                        } else {
+                            tracing::error!(failures = ?report.failures, "uninstall finished with errors");
+                            let detail = report.failures.join("\n");
+                            let _ = app
+                                .dialog()
+                                .message(format!(
+                                    "Some items could not be removed and may remain on disk:\n\n{detail}\n\nAlgunes dades no s'han pogut esborrar i poden quedar al disc."
+                                ))
+                                .title("Uninstall incomplete")
+                                .kind(MessageDialogKind::Warning)
+                                .blocking_show();
+                        }
+                        // MC-057: mark exit as confirmed BEFORE app.exit(0) so the
+                        // ExitRequested handler does not pop a second "Quit?" dialog
+                        // (data is already gone — re-prompting makes no sense). This
+                        // is also why the sidecar must be killed above: with
+                        // EXIT_CONFIRMED set, ExitRequested no longer routes through
+                        // graceful_quit, which used to be what killed it.
+                        crate::lifecycle::EXIT_CONFIRMED
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                         app.exit(0);
                     }
                 });

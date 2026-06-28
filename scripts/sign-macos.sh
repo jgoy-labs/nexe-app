@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# sign-macos.sh — Signat + notarització macOS per a releases públiques de nexe-app.
+# sign-macos.sh — macOS signing + notarization for public nexe-app releases.
 #
-# Flow complet (ADR-0008 active):
-#   1. cargo tauri build --release  → genera .app + .dmg sense signar
-#   2. codesign aplicat via TAURI_SIGNING_IDENTITY (signat de l'app)
+# Full flow (ADR-0008 active):
+#   1. cargo tauri build --release  → generates unsigned .app + .dmg
+#   2. codesign applied via TAURI_SIGNING_IDENTITY (app signing)
 #   3. xcrun notarytool submit    → Apple notarization servers
-#   4. xcrun stapler staple       → pega el ticket de notarització al DMG
+#   4. xcrun stapler staple       → staples the notarization ticket to the DMG
 #
-# Requisits previs (configurar una vegada abans de la primera release signada):
-#   - Apple Developer Program account (99 USD/any)
-#   - Developer ID Application certificate al Keychain
-#   - App-specific password d'Apple ID (per notarytool)
+# Prerequisites (configure once before the first signed release):
+#   - Apple Developer Program account (99 USD/year)
+#   - Developer ID Application certificate in the Keychain
+#   - Apple ID app-specific password (for notarytool)
 #
-# Ús:
+# Usage:
 #   export TAURI_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
 #   export TAURI_APPLE_ID="your-apple-id@example.com"
-#   export TAURI_APPLE_PASSWORD="@keychain:AC_PASSWORD"  # o valor directe
+#   export TAURI_APPLE_PASSWORD="@keychain:AC_PASSWORD"  # or direct value
 #   export TAURI_APPLE_TEAM_ID="XXXXXXXXXX"
 #   ./scripts/sign-macos.sh
 #
 # Troubleshooting:
-#   - `security find-identity -v -p codesigning` → veure certificats instal·lats
-#   - `xcrun notarytool history --apple-id ... --team-id ...` → revisar submissions
+#   - `security find-identity -v -p codesigning` → view installed certificates
+#   - `xcrun notarytool history --apple-id ... --team-id ...` → review submissions
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Validació variables entorn
+# Environment variable validation
 : "${TAURI_SIGNING_IDENTITY:?Need TAURI_SIGNING_IDENTITY (ex: 'Developer ID Application: Name (TEAMID)')}"
 : "${TAURI_APPLE_ID:?Need TAURI_APPLE_ID (Apple ID email)}"
 : "${TAURI_APPLE_PASSWORD:?Need TAURI_APPLE_PASSWORD (use @keychain:NAME, never a literal password)}"
@@ -47,11 +47,28 @@ echo "Apple ID : $TAURI_APPLE_ID"
 echo "Team ID  : $TAURI_APPLE_TEAM_ID"
 echo ""
 
-# Variables que tauri bundler llegeix directament
+# Variables that the tauri bundler reads directly
 export APPLE_SIGNING_IDENTITY="$TAURI_SIGNING_IDENTITY"
 export APPLE_ID="$TAURI_APPLE_ID"
 export APPLE_PASSWORD="$TAURI_APPLE_PASSWORD"
 export APPLE_TEAM_ID="$TAURI_APPLE_TEAM_ID"
+
+# B141: build hygiene for the public DMG — the `cargo tauri build` below builds
+# the distributed binary, so we apply the same path remap + SOURCE_DATE_EPOCH
+# as scripts/reproducible-build.sh to avoid embedding builder paths ($HOME,
+# $CARGO_HOME) in the panic traces / DWARF of the binary that reaches the user (P4 leak).
+# SOURCE_DATE_EPOCH: HEAD commit timestamp (fallback: now if there is no git).
+SOURCE_DATE_EPOCH="$(git log -1 --format=%ct HEAD 2>/dev/null || date +%s)"
+export SOURCE_DATE_EPOCH
+
+# No incremental caches (they can introduce non-determinism between builds).
+export CARGO_INCREMENTAL=0
+
+# Remap absolute → placeholders (masked in panic traces and DWARF).
+# Note: config.toml has --remap-path-prefix=@CARGO_HOME=@cargo with a literal token;
+# here we inject the real value in case it is not on PATH. Additive with prior RUSTFLAGS.
+CARGO_HOME_VAL="${CARGO_HOME:-$HOME/.cargo}"
+export RUSTFLAGS="--remap-path-prefix=${HOME}=~ --remap-path-prefix=${CARGO_HOME_VAL}=@cargo ${RUSTFLAGS:-}"
 
 echo "=== cargo tauri build --release ==="
 cd src-tauri
@@ -77,21 +94,27 @@ if [[ -d "$APP" ]]; then
             echo "⚠️  spctl assess ha fallat — comprovar notarització"
         }
     fi
+else
+    # B139: fail-closed. If `cargo tauri build` exits 0 but produces no .app
+    # (e.g. bundle path/name drift), the whole verification block above would be
+    # skipped silently and the script would report success. Abort loudly instead.
+    echo "❌  $APP no existeix — cargo tauri build no ha generat el bundle. Abortant." >&2
+    exit 1
 fi
 
 echo ""
 echo "=== Verificacio notarització DMG ==="
-# Parametritzat — escanejem DMGs generats en lloc d'assumir nom.
-# Suporta qualsevol version + arch (x86_64/aarch64/universal) sense hardcoding.
+# Parameterized — we scan generated DMGs instead of assuming a name.
+# Supports any version + arch (x86_64/aarch64/universal) without hardcoding.
 DMG_DIR="target/release/bundle/dmg"
 DMG_FAIL=0
 if [[ -d "$DMG_DIR" ]]; then
     for DMG in "$DMG_DIR"/*.dmg; do
         [[ -f "$DMG" ]] || continue
         echo "Verificant $(basename "$DMG"):"
-        # B138: en mode estricte (release pipeline) un DMG mal notaritzat ha
-        # d'aturar el build, no només avisar — un release silenciós amb DMG no
-        # notaritzat el rebutjaria Gatekeeper a casa de l'usuari.
+        # B138: in strict mode (release pipeline) a badly notarized DMG must
+        # stop the build, not just warn — a silent release with an un-notarized
+        # DMG would be rejected by Gatekeeper on the user's machine.
         if [[ "${NEXE_STRICT_SIGNING:-0}" == "1" ]]; then
             spctl -a -t open --context context:primary-signature -v "$DMG" || {
                 echo "❌  $(basename "$DMG") no notaritzat correctament (NEXE_STRICT_SIGNING=1)"

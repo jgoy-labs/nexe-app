@@ -272,7 +272,7 @@ Same pattern — add the plugin, convert entry to `App.vue`.
 
 The Rust layer (`lib.rs`), CSP, capabilities, plugin scheme, and CI are unaffected.
 
-## Auth baseline (active in the starter)
+## Auth baseline (S10 — active in the starter)
 
 The starter **ships with a session token baseline active** (Zero Trust local). Every app launch generates a fresh UUID v4 (128 bits entropy) in `setup()` and exposes it via `get_auth_token` command.
 
@@ -391,7 +391,6 @@ These are outside the starter's scope — opt-in when your app needs them:
 - `kill_process_tree()` Unix + Windows `Job Object` (prevents sidecar zombies).
 - Empirical validation of `plugin://` on Linux WebKitGTK (ADR-0012).
 - Plugin signatures (SHA-256 per plugin subtree) — needed before opening a marketplace.
-- SHA-pinning of GitHub Actions (Dependabot will help here once the repo is public).
 - macOS signing + notarization + Linux AppStream metadata.
 - Isolation Pattern is already active (ADR-0013). When adding commands, extend `isolation-frame/isolation.js` allowlist.
 

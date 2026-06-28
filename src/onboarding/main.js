@@ -25,6 +25,9 @@ export const state = {
   selectedModel: null,
   modelsPath: "",
   downloadProgress: 0,
+  /** INST-002-FE: non-blocking install warnings collected during step3
+   *  (e.g. SHA256_NOT_PINNED), recapped on step4. Reset per download attempt. */
+  shaWarnings: [],
   advanced: false,
   apiKey: "",
   /** Fase 4b: optional Hugging Face token. Held in memory only here;
@@ -105,6 +108,7 @@ function _resetToWelcome() {
   state.step = 1;
   state.selectedModel = null;
   state.downloadProgress = 0;
+  state.shaWarnings = [];
 }
 
 /** A persisted selectedModel is valid only with the current shape (engine + model_id + name). */
@@ -190,8 +194,12 @@ export async function _checkMetalWithRetry(maxMs = 15000, delayMs = 250) {
  * removed between versions — proceeding to download with a stale model_id
  * would fail opaquely. Resets to Welcome (and persists) on miss or error.
  */
-async function _validateResumedModel() {
+export async function _validateResumedModel() {
   if (state.step < 3 || !state.selectedModel) return;
+  // A "local" (custom folder) selection carries a filesystem path as model_id,
+  // not a catalog id — it lives outside the catalog and must not be validated
+  // against it, or resuming at step >= 3 always misses → spurious reset to Welcome.
+  if (state.selectedModel.engine === "local") return;
   try {
     if (!state.catalog.length) state.catalog = await invoke("fetch_catalog");
     const mid = state.selectedModel.model_id;
@@ -206,11 +214,29 @@ async function _validateResumedModel() {
   saveState();
 }
 
+// MC-040: bind the live system-theme listener exactly once for the page
+// lifetime. It looks up the current toggle button each time, so it never holds
+// a reference to a detached button — re-running initOnboarding no longer leaks a
+// new matchMedia listener (and a stale themeBtn closure) on every call.
+let _systemThemeListenerBound = false;
+function _bindSystemThemeListener() {
+  if (_systemThemeListenerBound) return;
+  _systemThemeListenerBound = true;
+  window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
+    if (localStorage.getItem("nexe_theme")) return; // manual preference wins
+    document.documentElement.classList.toggle("light", !e.matches);
+    const btn = document.querySelector(".theme-toggle");
+    if (btn) btn.textContent = e.matches ? "◑ dark" : "☀ light";
+  });
+}
+
 /**
  * Theme: follows the system by default; a saved preference takes precedence.
  * Appends the toggle button to the body and wires the live system listener.
  */
 function _setupTheme() {
+  if (document.querySelector(".theme-toggle")) return; // idempotent: never two toggles
+
   const savedTheme = localStorage.getItem("nexe_theme");
   const systemDark = window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? true;
   const useDark = savedTheme ? savedTheme === "dark" : systemDark;
@@ -225,13 +251,7 @@ function _setupTheme() {
     themeBtn.textContent = isLight ? "☀ light" : "◑ dark";
   });
 
-  // Listen for system changes in real time (only if no manual preference is set)
-  window.matchMedia?.("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
-    if (!localStorage.getItem("nexe_theme")) {
-      document.documentElement.classList.toggle("light", !e.matches);
-      themeBtn.textContent = e.matches ? "◑ dark" : "☀ light";
-    }
-  });
+  _bindSystemThemeListener();
 
   document.body.appendChild(themeBtn);
 }

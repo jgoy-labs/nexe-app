@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# test-privacy-gate.sh — harness REAL per a verify-privacy-gate.sh.
-# Anti-teatre: executa el gate DE DEBÒ sobre escenaris en tmpdir.
-#   - Escenari BRUT  (.test_data + worktrees + storage/ + *.db) → el gate ha de FALLAR.
-#   - Escenari NET   (només codi, inclòs memory/memory/storage) → el gate ha de PASSAR.
-# El happy path (escenari net) mata el "fix sabotejador": un gate que sempre
-# falla passaria el bug scenario però fallaria aquí.
+# test-privacy-gate.sh — REAL harness for verify-privacy-gate.sh.
+# Anti-theatre: runs the gate FOR REAL over scenarios in a tmpdir.
+#   - DIRTY scenario (.test_data + worktrees + storage/ + *.db) → the gate must FAIL.
+#   - CLEAN scenario (code only, including memory/memory/storage) → the gate must PASS.
+# The happy path (clean scenario) kills the "saboteur fix": a gate that always
+# fails would pass the bug scenario but fail here.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GATE="$SCRIPT_DIR/verify-privacy-gate.sh"
 fails=0
 
-# --- Escenari 1: BRUT → ha de FALLAR (exit != 0) ---
+# --- Scenario 1: DIRTY → must FAIL (exit != 0) ---
 DIRTY="$(mktemp -d)"
 mkdir -p "$DIRTY/app/.test_data/sessions" \
          "$DIRTY/app/worktrees/server-nexe-win/storage" \
@@ -30,7 +30,7 @@ else
 fi
 rm -rf "$DIRTY"
 
-# --- Escenari 2: NET → ha de PASSAR (exit 0), sense fals positiu pel mòdul Python ---
+# --- Scenario 2: CLEAN → must PASS (exit 0), no false positive from the Python module ---
 CLEAN="$(mktemp -d)"
 mkdir -p "$CLEAN/app/core" \
          "$CLEAN/app/memory/memory/storage" \

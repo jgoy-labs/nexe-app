@@ -13,11 +13,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # Linux portability:
-# Detecta OS/ARCH per resoldre el triplet PBS correcte. uv venv descarrega PBS
-# automàticament segons host, però aquesta variable serveix per logs i per a
-# futurs steps que necessitin saber el target (cross-build, etc.). No modifica
-# Step 5.5 (PBS copy) — `realpath venv/bin/python` ja resol el directori real
-# que uv ha baixat, independentment de la plataforma.
+# Detect OS/ARCH to resolve the correct PBS triple. uv venv downloads PBS
+# automatically based on the host, but this variable is useful for logs and for
+# future steps that need to know the target (cross-build, etc.). It does not modify
+# Step 5.5 (PBS copy) — `realpath venv/bin/python` already resolves the real directory
+# that uv downloaded, regardless of the platform.
 OS=$(uname -s)
 ARCH=$(uname -m)
 case "$OS-$ARCH" in
@@ -60,11 +60,11 @@ fi
 mkdir -p "$SIDECAR_DIR"
 
 # ── Step 2: Create venv with PBS Python via uv ───────────────────────
-# --managed-python: força uv a usar PBS portable (managed-installations),
-# evitant que reutilitzi un Python system. A Mac uv ja baixa PBS perquè 3.12
-# no és system. A Linux (Ubuntu 24.04 ARM64) `/usr/bin/python3.12` existeix
-# i uv el reutilitzaria → Step 5.5 rsync tot /usr → peta permisos sssd/netplan
-# i el bundle no és portable. Validat empíric the Linux test VM 2026-05-22 vespre.
+# --managed-python: forces uv to use the portable PBS (managed-installations),
+# preventing it from reusing a system Python. On Mac uv already downloads PBS because 3.12
+# is not a system Python. On Linux (Ubuntu 24.04 ARM64) `/usr/bin/python3.12` exists
+# and uv would reuse it → Step 5.5 rsyncs all of /usr → breaks sssd/netplan permissions
+# and the bundle is not portable. Empirically validated on the Linux test VM 2026-05-22 evening.
 echo "==> Creating venv with Python $PY_VERSION (PBS via uv, managed)..."
 START_VENV=$(date +%s)
 uv venv "$SIDECAR_DIR/venv" --python "$PY_VERSION" --managed-python --quiet
@@ -83,11 +83,11 @@ START_DEPS=$(date +%s)
 if [ -f "$REQUIREMENTS" ]; then
     uv pip install --python "$VENV_PY" -r "$REQUIREMENTS" --quiet
 
-    # Platform-specific deps. Si APP_SOURCE_DIR està set i conté un
+    # Platform-specific deps. If APP_SOURCE_DIR is set and contains a
     # requirements-macos.txt (server-nexe pattern: MLX-lm, MLX-vlm, etc.),
-    # l'instal·lem també. Sense això, els inference engines MLX + llama_cpp
-    # no estan disponibles al sidecar productiu i les UI dropdowns només
-    # mostren Ollama. Aplicable només a macOS arm64 (host detection).
+    # we install it too. Without this, the MLX + llama_cpp inference engines
+    # are not available in the production sidecar and the UI dropdowns only
+    # show Ollama. Applicable only to macOS arm64 (host detection).
     if [ "$(uname -s)" = "Darwin" ] && [ "$(uname -m)" = "arm64" ] && [ -n "${APP_SOURCE_DIR:-}" ]; then
         REQ_MACOS="$APP_SOURCE_DIR/requirements-macos.txt"
         if [ -f "$REQ_MACOS" ]; then
@@ -104,9 +104,20 @@ if [ -f "$REQUIREMENTS" ]; then
         # force the macosx_14 (Sonoma, Metal 3.1) wheels by URL. Runs on macOS 14/15/26.
         # The mlx core wheel is cp312 — it MUST match PY_VERSION ($PY_VERSION) above.
         echo "    Pinning MLX to macOS 14 (Sonoma) wheels for backward compatibility..."
+        # B136: pin the MLX wheels by URL WITH cryptographic hash verification
+        # (defense-in-depth supply-chain). NOTE: the 64-hex segment in the
+        # pythonhosted path is blake2b_256, NOT sha256 — these sha256 come from
+        # the PyPI JSON API (immutable per file): `curl -sL <url> | shasum -a 256`.
+        MLX_WHL="https://files.pythonhosted.org/packages/c3/47/5f33906cb03d6a378a697cd2d2641a26b37dea17ee3d9124d7e39e8eca01/mlx-0.31.2-cp312-cp312-macosx_14_0_arm64.whl"
+        MLX_METAL_WHL="https://files.pythonhosted.org/packages/3f/69/fe3b783ebe999f3118234e1e940feb622518bfb1dea6ac5d13b1d36a8449/mlx_metal-0.31.2-py3-none-macosx_14_0_arm64.whl"
+        MLX_SHA256="e5067aaf2be1f3d7bba5be52348775804f111173c1ed04639618fd713b1a530f"
+        MLX_METAL_SHA256="b25385bcee18fc194092255b8b53b9a3d8489eb650e59160f1b57aadd07aa2dc"
+        MLX_REQ="$(mktemp -t mlx-pin.XXXXXX)"
+        printf '%s --hash=sha256:%s\n%s --hash=sha256:%s\n' \
+            "$MLX_WHL" "$MLX_SHA256" "$MLX_METAL_WHL" "$MLX_METAL_SHA256" > "$MLX_REQ"
         uv pip install --python "$VENV_PY" --reinstall --no-deps --quiet \
-            "https://files.pythonhosted.org/packages/c3/47/5f33906cb03d6a378a697cd2d2641a26b37dea17ee3d9124d7e39e8eca01/mlx-0.31.2-cp312-cp312-macosx_14_0_arm64.whl" \
-            "https://files.pythonhosted.org/packages/3f/69/fe3b783ebe999f3118234e1e940feb622518bfb1dea6ac5d13b1d36a8449/mlx_metal-0.31.2-py3-none-macosx_14_0_arm64.whl"
+            --require-hashes -r "$MLX_REQ"
+        rm -f "$MLX_REQ"
         # Fail the build loudly if the pin didn't land (e.g. PY_VERSION bumped → cp tag mismatch).
         MLX_TAG=$(grep -h '^Tag:' "$SIDECAR_DIR"/venv/lib/python*/site-packages/mlx_metal-*.dist-info/WHEEL 2>/dev/null | head -1)
         case "$MLX_TAG" in
@@ -125,10 +136,10 @@ if [ -f "$REQUIREMENTS" ]; then
         echo "    Installing torch + torchvision (VLM support)..."
         uv pip install --python "$VENV_PY" "torch==2.11.0" "torchvision==0.26.0" --quiet
     elif [ "$(uname -s)" = "Linux" ] && [ -n "${APP_SOURCE_DIR:-}" ]; then
-        # First Linux release: Ollama-only. llama-cpp-python al release 1.1.
-        # MLX no aplica (Apple-only). Si APP_SOURCE_DIR exposa requirements-linux.txt
-        # (variant futur de server-nexe), instal·la els extres Linux-only allà;
-        # altrament, requirements.txt base ja inclou ollama_module + fastembed.
+        # First Linux release: Ollama-only. llama-cpp-python in release 1.1.
+        # MLX does not apply (Apple-only). If APP_SOURCE_DIR exposes requirements-linux.txt
+        # (future server-nexe variant), install the Linux-only extras there;
+        # otherwise, the base requirements.txt already includes ollama_module + fastembed.
         REQ_LINUX="$APP_SOURCE_DIR/requirements-linux.txt"
         if [ -f "$REQ_LINUX" ]; then
             echo "    Installing Linux-specific inference engine deps (Ollama-only)..."
@@ -136,8 +147,8 @@ if [ -f "$REQUIREMENTS" ]; then
         else
             echo "    No requirements-linux.txt found at $REQ_LINUX — skipping Linux extras (Ollama-only via base requirements)"
         fi
-        # TODO release 1.1 Linux: avaluar llama-cpp-python wheel Linux (CPU + opcional CUDA/Vulkan).
-        # No s'instal·la al 1r release per mantenir bundle petit + decisió arquitectural Ollama-only.
+        # TODO release 1.1 Linux: evaluate the Linux llama-cpp-python wheel (CPU + optional CUDA/Vulkan).
+        # Not installed in the 1st release to keep the bundle small + Ollama-only architectural decision.
     fi
 else
     # Minimal deps for POC
@@ -153,8 +164,8 @@ echo "    Dependencies installed in $((END_DEPS - START_DEPS))s"
 # build time ensures that even if a future regression drops the env var,
 # `is_xet_available()` returns False because the package literally isn't
 # importable. hf_xet is an optional dep of huggingface_hub (nothing else in
-# the sidecar — fastembed, MLX, llama.cpp, Ollama — relies on it). Validat
-# empíricament 2026-05-20.
+# the sidecar — fastembed, MLX, llama.cpp, Ollama — relies on it). Empirically
+# validated 2026-05-20.
 if uv pip list --python "$VENV_PY" 2>/dev/null | grep -qi "^hf-xet\|^hf_xet "; then
     echo "==> Removing hf_xet from bundle (belt-and-braces)..."
     uv pip uninstall --python "$VENV_PY" hf_xet --quiet || true
@@ -165,23 +176,24 @@ echo "==> Copying application code..."
 mkdir -p "$SIDECAR_DIR/app"
 if [ -n "$APP_SOURCE_DIR" ]; then
     # Multi-file mode (server-nexe): copy entire source directory.
-    # rsync amb excludes per evitar privacy leak.
+    # rsync with excludes to avoid a privacy leak.
     #
-    # Root cause — la inestabilitat recurrent del
-    # smoke ve de DEV contamination dins el bundle: .test_venv/ Python venv
-    # de tests, node_modules/, scripts/, docs/, knowledge/, README*.md i
-    # pytest configs s'inclouien al sidecar/app/. El .test_venv en particular
-    # exposava .pth files al sys.path que feien que el module_manager
-    # descobrís els plugins al source dir de dev (server-nexe/plugins/) enlloc
-    # del sidecar extret. Cada fix destapava una capa nova.
+    # Root cause — the recurring smoke instability
+    # comes from DEV contamination inside the bundle: .test_venv/ test Python
+    # venv, node_modules/, scripts/, docs/, knowledge/, README*.md and
+    # pytest configs were included in sidecar/app/. The .test_venv in particular
+    # exposed .pth files on sys.path that made the module_manager
+    # discover plugins in the dev source dir (server-nexe/plugins/) instead
+    # of the extracted sidecar. Each fix uncovered a new layer.
     #
-    # Leading slash a /pattern = anchored a $APP_SOURCE_DIR; sense slash
-    # match a qualsevol profunditat (per això sense slash exclou también
-    # memory/memory/storage/, que és un mòdul Python real i NO ho volem).
+    # Leading slash in /pattern = anchored to $APP_SOURCE_DIR; without a slash it
+    # matches at any depth (which is why, without a slash, it also excludes
+    # memory/memory/storage/, a real Python module that we do NOT want excluded).
     rsync -a \
         --exclude='/storage' --exclude='.env' --exclude='/.git' \
         --exclude='__pycache__' --exclude='/venv' --exclude='/diari' \
         --exclude='/tests' --exclude='/InstallNexe.app' --exclude='/Nexe.app' \
+        --exclude='/dev-tools' \
         --exclude='/.test_venv' --exclude='/.venv' \
         --exclude='/.test_data' --exclude='/worktrees' \
         --exclude='/.github' --exclude='/.grimp_cache' --exclude='/.ruff_cache' \
@@ -220,21 +232,21 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         --exclude='/installer/ollama-checksums.txt' \
         --exclude='/installer/wheels-checksums.txt' \
         "$APP_SOURCE_DIR/." "$SIDECAR_DIR/app/"
-    # Incloem els mòduls Python d'installer/ que el sidecar
-    # importa runtime — installer_ollama_install (ensure_ollama_installed),
+    # We include the installer/ Python modules that the sidecar
+    # imports at runtime — installer_ollama_install (ensure_ollama_installed),
     # download_verify (verify_download_integrity), installer_catalog_data
     # (MODEL_WEIGHT_SHA256), installer_hardware, installer_setup_env (preseed),
-    # installer_setup_models (patró download).
+    # installer_setup_models (download pattern).
     #
-    # IMPORTANT: el graf de deps obliga a mantenir TOTA la família installer_*.py
-    # perquè ollama_install i tota la resta importen .installer_display + .installer_i18n,
-    # i installer_i18n importa .installer_translations*. Excloure qualsevol trenca
-    # els imports en cadena. Pesen pocs KB (terminal print + strings), neutral.
+    # IMPORTANT: the dependency graph forces us to keep the WHOLE installer_*.py family
+    # because ollama_install and everything else import .installer_display + .installer_i18n,
+    # and installer_i18n imports .installer_translations*. Excluding any of them breaks
+    # the import chain. They weigh a few KB (terminal print + strings), neutral.
     #
-    # Excloem swift-wizard (278 MB, notarytool log 4d42c92d), NexeTray.app legacy,
-    # tray_*.py i wheels-checksums.txt (legacy CLI), build_*.sh scripts, imatges DMG
-    # i CLI standalone (install.py + install_headless.py). Tot té equivalent a
-    # nexe-app/Tauri (wizard HTML + tray nadiu + scripts propis).
+    # We exclude swift-wizard (278 MB, notarytool log 4d42c92d), legacy NexeTray.app,
+    # tray_*.py and wheels-checksums.txt (legacy CLI), build_*.sh scripts, DMG images
+    # and the standalone CLI (install.py + install_headless.py). Everything has an
+    # equivalent in nexe-app/Tauri (wizard HTML + native tray + its own scripts).
     echo "    Source dir: $APP_SOURCE_DIR"
 else
     # Single-file mode (poc-sidecar default): copy one .py file as app.py.
@@ -242,32 +254,32 @@ else
 fi
 
 # ── Step 4.5: Pre-seed fastembed embedder cache ───────────────────────
-# Sense aquest preseed, el primer chat post-wizard fallava silenciosament
-# perquè fastembed intentava descarregar el model paraphrase-multilingual-
-# mpnet-base-v2 al primer TextEmbedding() call. Amb HF_HUB_OFFLINE=1 forçat
-# pel lifespan, la descàrrega petava.
+# Without this preseed, the first chat after the wizard would silently fail
+# because fastembed tried to download the paraphrase-multilingual-
+# mpnet-base-v2 model on the first TextEmbedding() call. With HF_HUB_OFFLINE=1 forced
+# by the lifespan, the download would break.
 #
-# Estratègia (validat empíricament 2026-05-20):
-# - Pre-seed durant build a app/.fastembed_cache/ (staging dins bundle).
-# - Al primer launch del sidecar (Step 5.9 del launcher), copy de bundle a
-#   ~/.cache/fastembed/ (writable) — vegi's `_seed_fastembed_cache()` original
-#   a installer/installer_setup_env.py:207 per la lògica equivalent.
-# - NO setem FASTEMBED_CACHE_DIR al launcher: fastembed escriu
-#   `files_metadata.json` al primer load → causaria PermissionError en read-only.
+# Strategy (empirically validated 2026-05-20):
+# - Pre-seed during build into app/.fastembed_cache/ (staging inside the bundle).
+# - On the sidecar's first launch (Step 5.9 of the launcher), copy from the bundle to
+#   ~/.cache/fastembed/ (writable) — see the original `_seed_fastembed_cache()`
+#   at installer/installer_setup_env.py:207 for the equivalent logic.
+# - Do NOT set FASTEMBED_CACHE_DIR in the launcher: fastembed writes
+#   `files_metadata.json` on first load → would cause a PermissionError when read-only.
 #
-# Graceful: si el host build no té internet, warning i continuem. La descàrrega
-# es farà online al primer chat (com abans, però amb logs clars).
+# Graceful: if the build host has no internet, warn and continue. The download
+# will happen online at the first chat (as before, but with clear logs).
 if [ -n "${APP_SOURCE_DIR:-}" ]; then
     echo "==> Pre-seeding fastembed embedder cache..."
     START_FE=$(date +%s)
     FASTEMBED_STAGING="$SIDECAR_DIR/app/.fastembed_cache"
     mkdir -p "$FASTEMBED_STAGING"
-    # IMPORTANT 1: fastembed library NO respecta FASTEMBED_CACHE_DIR env var
-    # (verificat empíricament 2026-05-20). Cal passar cache_dir explícit al
-    # constructor TextEmbedding(model, cache_dir=...).
-    # IMPORTANT 2: Step 4.5 corre ABANS del PBS copy (Step 5.5), per tant
-    # python-runtime/ encara NO existeix al bundle. NO settem PYTHONHOME —
-    # deixem que el venv usi el seu PBS natural (uv default).
+    # IMPORTANT 1: the fastembed library does NOT honour the FASTEMBED_CACHE_DIR env var
+    # (empirically verified 2026-05-20). The cache_dir must be passed explicitly to the
+    # TextEmbedding(model, cache_dir=...) constructor.
+    # IMPORTANT 2: Step 4.5 runs BEFORE the PBS copy (Step 5.5), so
+    # python-runtime/ does NOT yet exist in the bundle. We do NOT set PYTHONHOME —
+    # we let the venv use its natural PBS (uv default).
     PYTHONNOUSERSITE=1 \
       FASTEMBED_STAGING_PATH="$FASTEMBED_STAGING" \
       "$VENV_PY" -c "import os; from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-multilingual-mpnet-base-v2', cache_dir=os.environ['FASTEMBED_STAGING_PATH'])" \
@@ -294,9 +306,9 @@ VENV_PY="$SIDECAR_DIR/venv/bin/python3"
 # Ensure no system Python contamination
 export PYTHONNOUSERSITE=1
 export PYTHONDONTWRITEBYTECODE=1
-# PBS portable safety net. Si pyvenv.cfg `home=relatiu` falla per algun
-# motiu (Python rebutja el path, build futur amb PBS estructura diferent),
-# PYTHONHOME explicit garanteix que sys.base_prefix apunti al PBS dins el bundle.
+# PBS portable safety net. If pyvenv.cfg `home=relative` fails for some
+# reason (Python rejects the path, future build with a different PBS structure),
+# an explicit PYTHONHOME guarantees sys.base_prefix points to the PBS inside the bundle.
 export PYTHONHOME="$SIDECAR_DIR/python-runtime"
 # Unbuffered I/O: emit logs in real time (no stdout/stderr buffering).
 # Required so Rust spawner can capture sidecar logs as they happen,
@@ -304,12 +316,12 @@ export PYTHONHOME="$SIDECAR_DIR/python-runtime"
 export PYTHONUNBUFFERED=1
 
 # Seed fastembed cache to ~/.cache/fastembed/ at
-# first launch. El bundle porta el cache pre-seedat a app/.fastembed_cache/
-# (read-only dins l'app signada). fastembed escriu files_metadata.json al
-# primer load → si el cache fos read-only, PermissionError. Solucio:
-# copiar al user cache (writable) al primer launch nomes. Reprodueix la
-# logica de installer/installer_setup_env.py:_seed_fastembed_cache().
-# Validat empíricament 2026-05-20 (Opcio B).
+# first launch. The bundle ships the cache pre-seeded at app/.fastembed_cache/
+# (read-only inside the signed app). fastembed writes files_metadata.json on
+# first load → if the cache were read-only, PermissionError. Solution:
+# copy to the user cache (writable) only on first launch. Reproduces the
+# logic of installer/installer_setup_env.py:_seed_fastembed_cache().
+# Empirically validated 2026-05-20 (Option B).
 EMBEDDER_DIR="$HOME/.cache/fastembed/models--sentence-transformers--paraphrase-multilingual-mpnet-base-v2"
 if [ -d "$SIDECAR_DIR/app/.fastembed_cache" ] && [ ! -d "$EMBEDDER_DIR" ]; then
     echo "First launch: seeding fastembed cache to ~/.cache/fastembed/..." >&2
@@ -350,21 +362,21 @@ LAUNCHER
 chmod +x "$SIDECAR_DIR/nexe-sidecar"
 
 # ── Step 5.5: Copy Python Build Standalone into bundle ──────────────
-# Bug arrel descobert 2026-05-18: `uv venv` crea symlinks absoluts al
-# PBS de l'usuari de build (~/.local/share/uv/python/cpython-3.12.11-.../bin/
-# python3.12). Al Mac destinatari (usuari diferent), el symlink queda trencat i
-# el launcher line 39 falla amb "No such file or directory". Solucio: copiar
-# el PBS sencer dins el bundle, fer els symlinks relatius, fer pyvenv.cfg
-# relocatable. Validat empíricament 2026-05-18.
+# Root bug discovered 2026-05-18: `uv venv` creates absolute symlinks to the
+# build user's PBS (~/.local/share/uv/python/cpython-3.12.11-.../bin/
+# python3.12). On the target Mac (different user), the symlink is broken and
+# launcher line 39 fails with "No such file or directory". Solution: copy
+# the entire PBS into the bundle, make the symlinks relative, make pyvenv.cfg
+# relocatable. Empirically validated 2026-05-18.
 echo "==> Copying PBS runtime into bundle (portable)..."
-# Resol el directori PBS real des del symlink absolut creat per uv venv:
-# venv/bin/python -> .../bin/python3.12, dos dirname per arribar al PBS root.
+# Resolve the real PBS directory from the absolute symlink created by uv venv:
+# venv/bin/python -> .../bin/python3.12, two dirname calls to reach the PBS root.
 PBS_REAL=$(realpath "$SIDECAR_DIR/venv/bin/python")
 PBS_DIR=$(dirname "$(dirname "$PBS_REAL")")
 echo "    PBS source: $PBS_DIR"
 mkdir -p "$SIDECAR_DIR/python-runtime"
-# rsync -a preserva symlinks intra-PBS i permisos. Exclou include/ (~8 MB
-# headers per compilacio, no calen runtime) i share/ (~1 MB doc).
+# rsync -a preserves intra-PBS symlinks and permissions. Excludes include/ (~8 MB
+# headers for compilation, not needed at runtime) and share/ (~1 MB doc).
 rsync -a --delete \
     --exclude='include/' \
     --exclude='share/' \
@@ -373,11 +385,11 @@ PBS_SIZE=$(du -sh "$SIDECAR_DIR/python-runtime" | cut -f1)
 echo "    PBS copied: $PBS_SIZE"
 
 # ── Step 5.6: Rewrite venv symlinks relatively ──────────────────────
-# Els 3 symlinks del venv/bin/ (python, python3, python3.12) apunten ara al
-# PBS absolut del build machine. Cal substituir-los per symlinks RELATIUS al
-# python-runtime/ que acabem de copiar. Aixi, quan Tauri extreu el tarball a
-# ~/Library/Application Support/com.nexe.app/sidecar/, els symlinks resolen
-# correctament dins el directori extret.
+# The 3 venv/bin/ symlinks (python, python3, python3.12) now point to the
+# absolute PBS of the build machine. They must be replaced with RELATIVE symlinks to
+# the python-runtime/ we just copied. This way, when Tauri extracts the tarball to
+# ~/Library/Application Support/com.nexe.app/sidecar/, the symlinks resolve
+# correctly inside the extracted directory.
 echo "==> Rewriting venv symlinks to relative PBS paths..."
 ( cd "$SIDECAR_DIR/venv/bin" && \
     rm -f python python3 python3.12 && \
@@ -387,20 +399,20 @@ echo "==> Rewriting venv symlinks to relative PBS paths..."
 echo "    Symlinks: python, python3, python3.12 -> ../../python-runtime/bin/python3.12"
 
 # ── Step 5.7: Rewrite pyvenv.cfg relocatable ────────────────────────
-# Substitueix `home = $HOME/.local/share/uv/python/.../bin` per un path
-# relatiu (../../python-runtime/bin) i activa `relocatable = true`. Python 3.12
-# resol `home` relatiu respecte al directori del pyvenv.cfg (venv/), via site.py.
-# `relocatable = true` forca recalcular sys.prefix des de la ubicacio real del
-# venv (no des de `home` absolut hardcoded), cobrint el cas que `home` falli a
-# resoldre. Combinat amb PYTHONHOME al launcher (Step 5), es la configuracio
-# mes robusta (font: CPython Lib/site.py).
+# Replaces `home = $HOME/.local/share/uv/python/.../bin` with a relative
+# path (../../python-runtime/bin) and enables `relocatable = true`. Python 3.12
+# resolves a relative `home` against the pyvenv.cfg directory (venv/), via site.py.
+# `relocatable = true` forces sys.prefix to be recomputed from the venv's real
+# location (not from a hardcoded absolute `home`), covering the case where `home` fails
+# to resolve. Combined with PYTHONHOME in the launcher (Step 5), it is the most
+# robust configuration (source: CPython Lib/site.py).
 echo "==> Rewriting pyvenv.cfg for relocatable PBS..."
 UV_VERSION_STR=$(uv --version 2>/dev/null | awk '{print $2}')
-# home= és RELATIU al directori del pyvenv.cfg (CPython Lib/site.py resol amb
-# os.path.join(os.path.dirname(cfg_path), home)). pyvenv.cfg viu a
-# target/sidecar/venv/pyvenv.cfg → directori del cfg = venv/ → `..` és
-# target/sidecar/ → `../python-runtime/bin` apunta al PBS germà. NOMÉS un
-# nivell `..` (no dos), perquè el cfg viu a venv/, no a venv/bin/.
+# home= is RELATIVE to the pyvenv.cfg directory (CPython Lib/site.py resolves with
+# os.path.join(os.path.dirname(cfg_path), home)). pyvenv.cfg lives at
+# target/sidecar/venv/pyvenv.cfg → cfg directory = venv/ → `..` is
+# target/sidecar/ → `../python-runtime/bin` points to the sibling PBS. ONLY one
+# `..` level (not two), because the cfg lives in venv/, not venv/bin/.
 cat > "$SIDECAR_DIR/venv/pyvenv.cfg" <<PYVENV
 home = ../python-runtime/bin
 implementation = CPython
@@ -452,9 +464,9 @@ case "$OS" in
 esac
 
 # G3: sys.executable resolves to a path inside the bundle.
-# Simula el launcher real: PYTHONHOME apunta al PBS dins el bundle. Sense
-# PYTHONHOME, el PBS de uv té un prefix hardcoded (/install) que falla. El
-# launcher SEMPRE el defineix (Step 5), per això el test també.
+# Simulates the real launcher: PYTHONHOME points to the PBS inside the bundle. Without
+# PYTHONHOME, uv's PBS has a hardcoded prefix (/install) that fails. The
+# launcher ALWAYS defines it (Step 5), which is why the test does too.
 SYS_EXEC=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY_LINK" -c "import sys; print(sys.executable)")
 case "$SYS_EXEC" in
     "$SIDECAR_DIR"/*)
@@ -467,11 +479,11 @@ case "$SYS_EXEC" in
 esac
 
 # G5: portability test - copy sidecar to /tmp/ and verify python3 still works.
-# Tornem a definir PYTHONHOME apuntat al python-runtime/ del CÒPIA (simulant
-# el que faria el launcher al Mac destinatari, on PYTHONHOME es deriva
-# dinàmicament de $SIDECAR_DIR/python-runtime).
-# Linux: minimal copy (~50 MB) per a builders space-constrained (the Linux test VM UTM
-# pot tenir <500 MB lliures abans del resize). Mac: full copy històric (~400 MB).
+# Redefine PYTHONHOME pointing to the python-runtime/ of the COPY (simulating
+# what the launcher would do on the target Mac, where PYTHONHOME is derived
+# dynamically from $SIDECAR_DIR/python-runtime).
+# Linux: minimal copy (~50 MB) for space-constrained builders (the Linux test VM UTM
+# may have <500 MB free before the resize). Mac: historical full copy (~400 MB).
 PORT_TEST_DIR="/tmp/nexe-sidecar-portable-test-$$"
 echo "==> G5 portability test (copy to $PORT_TEST_DIR)..."
 rm -rf "$PORT_TEST_DIR"
@@ -481,7 +493,7 @@ case "$OS" in
         cp -R "$SIDECAR_DIR/." "$PORT_TEST_DIR/"
         ;;
     Linux)
-        # Suficient per validar que el Python copiat arrenca + stdlib C ext OK.
+        # Enough to validate that the copied Python boots + stdlib C ext OK.
         mkdir -p "$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv"
         cp -R "$SIDECAR_DIR/python-runtime/." "$PORT_TEST_DIR/python-runtime/"
         cp -R "$SIDECAR_DIR/venv/bin" "$PORT_TEST_DIR/venv/"
@@ -503,10 +515,10 @@ rm -rf "$PORT_TEST_DIR"
 echo "    G5 PASS: copied bundle python3 works + stdlib C extensions OK"
 
 # G6: no builder home references in TEXT content of the bundle.
-# Tolera matches a egg-info/RECORD (metadades inofensives, no afecten runtime).
-# Linux: $HOME cobreix /root, LDAP (/export/home/...), NixOS, Docker (/app),
-# WSL i altres homes personalitzats. Mac: /Users/$BUILDER preserva el comportament
-# històric (a macOS $HOME = /Users/$USER sempre, semànticament equivalent).
+# Tolerates matches in egg-info/RECORD (harmless metadata, no runtime impact).
+# Linux: $HOME covers /root, LDAP (/export/home/...), NixOS, Docker (/app),
+# WSL and other custom homes. Mac: /Users/$BUILDER preserves the historical
+# behaviour (on macOS $HOME = /Users/$USER always, semantically equivalent).
 BUILDER=$(whoami)
 case "$OS" in
     Darwin) BUILDER_HOME_PREFIX="/Users/$BUILDER" ;;
@@ -515,10 +527,10 @@ esac
 GREP_HITS=$(grep -rI "$BUILDER_HOME_PREFIX" "$SIDECAR_DIR" 2>/dev/null | wc -l | tr -d ' ')
 if [ "$GREP_HITS" -ne 0 ]; then
     echo "    G6 WARN: $GREP_HITS references to $BUILDER_HOME_PREFIX found (first 5):"
-    # `|| true` neutralitza exit 141 (SIGPIPE) que es dispara quan head -5 tanca
-    # la pipe abans que grep acabi. set -e pipefail (línia 10) no perdona 141,
-    # aborta el script. A Mac amb pocs hits no es notava; a Linux amb 26+
-    # refs (activate scripts venv) el SIGPIPE és garantit.
+    # `|| true` neutralizes exit 141 (SIGPIPE) that fires when head -5 closes
+    # the pipe before grep finishes. set -e pipefail (line 10) does not forgive 141,
+    # it aborts the script. On Mac with few hits it went unnoticed; on Linux with 26+
+    # refs (venv activate scripts) the SIGPIPE is guaranteed.
     grep -rI "$BUILDER_HOME_PREFIX" "$SIDECAR_DIR" 2>/dev/null | head -5 || true
 else
     echo "    G6 PASS: no $BUILDER_HOME_PREFIX references in text files"
@@ -540,14 +552,22 @@ rm -rf "$SIDECAR_DIR/venv/lib/python${PY_VERSION}/site-packages/setuptools" 2>/d
 find "$SIDECAR_DIR/venv/lib" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
 find "$SIDECAR_DIR/venv/lib" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 
+# B135: remove venv activate scripts — they embed the builder's absolute
+# $VIRTUAL_ENV path (a plaintext home-dir leak that travels into the DMG).
+# The launcher NEVER sources them (it runs "$VENV_PY" -m uvicorn with PYTHONHOME),
+# so dropping them is safe. A non-matching glob stays literal and `rm -f` returns 0
+# under set -euo pipefail. (Text-only mitigation: binaries still embed the path
+# via install-names/.pyc co_filename — see G6, which stays WARN by design.)
+rm -f "$SIDECAR_DIR"/venv/bin/activate*
+
 echo "    Trimmed $TRIMMED __pycache__ dirs + pip/setuptools/test dirs"
 
 # ── Step 6.5: Sign Mach-O binaries in venv ──────────────────────────
-# Per a notarytzació Apple cal que TOTS els .so/.dylib del venv portin
-# Developer ID + secure timestamp + hardened runtime. Si APPLE_SIGNING_IDENTITY
-# està set, signa ~330 binaris (~1-3 min). Sense identity, salta amb avís
-# (dev build local sense cert). El smoke test posterior valida que els
-# binaris signats encara importen correctament.
+# For Apple notarization, ALL .so/.dylib in the venv must carry
+# Developer ID + secure timestamp + hardened runtime. If APPLE_SIGNING_IDENTITY
+# is set, it signs ~330 binaries (~1-3 min). Without an identity, it skips with a warning
+# (local dev build without a cert). The subsequent smoke test validates that the
+# signed binaries still import correctly.
 if [ "$OS" = "Darwin" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
     bash "$SCRIPT_DIR/sign-sidecar-binaries.sh" "$SIDECAR_DIR"
 elif [ "$OS" = "Darwin" ]; then
@@ -571,12 +591,12 @@ else
 fi
 
 # ── Step 7: Validate ─────────────────────────────────────────────────
-# PBS de uv té prefix hardcoded /install — PYTHONHOME OBLIGATORI per
-# trobar el mòdul `encodings` al bootstrap (init_fs_encoding). El pyvenv.cfg
-# `home` només s'aplica post-bootstrap (site-packages discovery del venv).
-# Validat empíricament 2026-05-18 build run 1: sense PYTHONHOME falla amb
+# uv's PBS has a hardcoded /install prefix — PYTHONHOME is MANDATORY to
+# find the `encodings` module at bootstrap (init_fs_encoding). The pyvenv.cfg
+# `home` only applies post-bootstrap (venv site-packages discovery).
+# Empirically validated 2026-05-18 build run 1: without PYTHONHOME it fails with
 # "Fatal Python error: init_fs_encoding: failed... No module named 'encodings'".
-# El launcher (Step 5) sempre defineix PYTHONHOME, igual que els tests aquí.
+# The launcher (Step 5) always defines PYTHONHOME, just like the tests here.
 echo "==> Validating sidecar..."
 PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import fastapi; print(f'  FastAPI {fastapi.__version__}')"
 PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import uvicorn; print(f'  uvicorn {uvicorn.__version__}')"
@@ -587,24 +607,28 @@ PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import uvicorn; print(f'
 echo "==> Smoke test (boot + authenticated health check)..."
 SMOKE_TOKEN=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import uuid; print(uuid.uuid4())")
 SMOKE_PORT=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); print(p)")
+# B137: PID-suffixed boot log (consistency with PORT_TEST_DIR which already uses $$).
+# Used in 4 places below INCLUDING the verify-encryption-gate.sh call (CRY-01) —
+# all must reference this var or the gate reads a stale/missing path.
+SMOKE_BOOT_LOG="/tmp/nexe-sidecar-boot-$$.log"
 
-# Endpoint health depèn de l'app del sidecar.
+# Health endpoint depends on the sidecar app.
 # - POC default (poc-sidecar/app.py): /api/v1/system/health
-# - server-nexe real: /admin/system/health (registrat a system.py:246)
-# Detecció via APP_SOURCE_DIR (empty=POC, set=multi-file → assumim server-nexe).
-# Quan es refactori la unificació d'endpoints, aquest condicional desapareix.
+# - real server-nexe: /admin/system/health (registered at system.py:246)
+# Detection via APP_SOURCE_DIR (empty=POC, set=multi-file → we assume server-nexe).
+# When the endpoint unification is refactored, this conditional disappears.
 if [ -n "$APP_SOURCE_DIR" ]; then
     HEALTH_PATH="/admin/system/health"
-    # server-nexe arrenca lent (RAG + memory + tray + fastembed pre-warm)
+    # server-nexe boots slowly (RAG + memory + tray + fastembed pre-warm)
     SMOKE_BOOT_MAX_WAIT=30
 else
     HEALTH_PATH="/api/v1/system/health"
     SMOKE_BOOT_MAX_WAIT=5
 fi
 
-# Env vars que Tauri (lib.rs spawn_sidecar_process) injecta en producció.
-# Repliquem aquí al smoke per coherència — sense això, validate_production_security
-# (factory_security.py) tira ValueError abans d'arribar a uvicorn.
+# Env vars that Tauri (lib.rs spawn_sidecar_process) injects in production.
+# We replicate them here in the smoke test for consistency — without this, validate_production_security
+# (factory_security.py) raises ValueError before reaching uvicorn.
 echo "$SMOKE_TOKEN" | \
     NEXE_PORT="$SMOKE_PORT" \
     NEXE_SIDECAR=1 \
@@ -618,13 +642,13 @@ echo "$SMOKE_TOKEN" | \
     NEXE_QDRANT_PATH="$SIDECAR_DIR/vectors" \
     NEXE_PARENT_PID="$$" \
     NEXE_TRAY_PID="$$" \
-    "$SIDECAR_DIR/nexe-sidecar" >/tmp/nexe-sidecar-boot.log 2>&1 &
+    "$SIDECAR_DIR/nexe-sidecar" >"$SMOKE_BOOT_LOG" 2>&1 &
 SIDECAR_PID=$!
 
-# Polling adaptat — server-nexe triga 15-25s a estar ready (memory + fastembed pre-warm).
-# Sortim del bucle al primer 200 o quan superem el màxim.
-# Desactivem set -e localment: curl -sf retorna codi != 0 quan el sidecar encara no
-# accepta connexions (ECONNREFUSED), i amb set -e actiu això mata el script.
+# Adapted polling — server-nexe takes 15-25s to become ready (memory + fastembed pre-warm).
+# We exit the loop on the first 200 or when we exceed the maximum.
+# We disable set -e locally: curl -sf returns a non-zero code while the sidecar is not yet
+# accepting connections (ECONNREFUSED), and with set -e active that kills the script.
 set +e
 HEALTH="FAIL"
 SMOKE_ELAPSED=0
@@ -662,26 +686,26 @@ rm -rf "$SIDECAR_DIR/app/storage" 2>/dev/null || true
 # tarball and violate G1 (no transient artifacts in payload).
 find "$SIDECAR_DIR/venv" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
-# Match condicional: POC retorna {"status":"ok"}, server-nexe retorna {"status":"healthy"...}
+# Conditional match: POC returns {"status":"ok"}, server-nexe returns {"status":"healthy"...}
 if echo "$HEALTH" | grep -qE '"status":\s*"(ok|healthy)"'; then
     echo "    Health check: PASS (authenticated, endpoint $HEALTH_PATH)"
 else
     echo "    Health check: FAIL (endpoint $HEALTH_PATH)"
     echo "    Response: $HEALTH"
-    echo "    Sidecar boot log: /tmp/nexe-sidecar-boot.log (últimes 20 línies):"
-    tail -20 /tmp/nexe-sidecar-boot.log 2>/dev/null
+    echo "    Sidecar boot log: $SMOKE_BOOT_LOG (últimes 20 línies):"
+    tail -20 "$SMOKE_BOOT_LOG" 2>/dev/null
     exit 1
 fi
 
-# B082 (CRY-01): el sidecar server-nexe ha d'arrencar amb encriptació-at-rest
-# activa. La lògica viu a verify-encryption-gate.sh perquè sigui testejable
-# (test-encryption-gate.sh). Camí POC (APP_SOURCE_DIR buit) → se salta net.
-"$SCRIPT_DIR/verify-encryption-gate.sh" "$APP_SOURCE_DIR" /tmp/nexe-sidecar-boot.log || exit 1
+# B082 (CRY-01): the server-nexe sidecar must boot with encryption-at-rest
+# active. The logic lives in verify-encryption-gate.sh so it is testable
+# (test-encryption-gate.sh). POC path (empty APP_SOURCE_DIR) → cleanly skipped.
+"$SCRIPT_DIR/verify-encryption-gate.sh" "$APP_SOURCE_DIR" "$SMOKE_BOOT_LOG" || exit 1
 
-# B183/B184: el sidecar staged no ha d'arrossegar dades de DEV/test (.test_data,
-# worktrees/, storage/ runtime, *.db de memòria). Gate determinista i testejable
-# (test-privacy-gate.sh) — última xarxa abans d'empaquetar; complementa els
-# excludes del rsync (Step 4) i el rm -rf app/storage de dalt.
+# B183/B184: the staged sidecar must not drag in DEV/test data (.test_data,
+# worktrees/, runtime storage/, memory *.db). Deterministic, testable gate
+# (test-privacy-gate.sh) — last net before packaging; complements the
+# rsync excludes (Step 4) and the rm -rf app/storage above.
 if [ -d "$SIDECAR_DIR/app" ]; then
     "$SCRIPT_DIR/verify-privacy-gate.sh" "$SIDECAR_DIR/app" || exit 1
 fi

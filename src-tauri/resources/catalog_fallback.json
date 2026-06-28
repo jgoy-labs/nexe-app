@@ -20,12 +20,11 @@
     "ram_gb": 10.0,
     "disk_gb": 3.4,
     "backends": [
-      "MLX",
-      "Ollama"
+      "MLX"
     ],
     "flags": [],
     "origin": "Alibaba",
-    "ollama": "qwen3.5:4b",
+    "ollama": null,
     "mlx": "mlx-community/Qwen3.5-4B-MLX-8bit",
     "gguf": null
   },
@@ -92,23 +91,6 @@
     "ollama": "hdnh2006/salamandra-7b-instruct:q4_K_M",
     "mlx": null,
     "gguf": "https://huggingface.co/hdnh2006/BSC-LT-salamandra-7b-instruct-gguf/resolve/main/salamandra-7b-instruct-Q4_K_M.gguf"
-  },
-  {
-    "name": "Gemma 4 31B",
-    "params": "31B (dense)",
-    "ram_gb": 10.0,
-    "disk_gb": 18.5,
-    "backends": [
-      "MLX",
-      "Ollama"
-    ],
-    "flags": [],
-    "origin": "Google",
-    "ollama": "gemma4:31b",
-    "mlx": "mlx-community/gemma-4-31b-it-8bit",
-    "gguf": null,
-    "gated": "manual",
-    "license_url": "https://huggingface.co/google/gemma-4-31b-it"
   },
   {
     "name": "Qwen3.5 27B",

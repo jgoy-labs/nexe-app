@@ -28,6 +28,18 @@ export function step4() {
   trayHint.textContent = t("step4_tray_hint", state.lang);
   wrapper.appendChild(trayHint);
 
+  // INST-002-FE: recap any non-blocking install warning (e.g. a model installed
+  // without a SHA256 pin) here, where the user actually sees it — step3
+  // auto-advances too fast for the inline notice alone to register.
+  if (state.shaWarnings && state.shaWarnings.length > 0) {
+    const banner = document.createElement("div");
+    banner.className = "sha-warning-banner";
+    const warn = document.createElement("p");
+    warn.textContent = "⚠ " + t("step4_sha_warning", state.lang);
+    banner.appendChild(warn);
+    wrapper.appendChild(banner);
+  }
+
   const btn = document.createElement("button");
   btn.className = "btn-primary";
   btn.textContent = t("btn_next", state.lang);

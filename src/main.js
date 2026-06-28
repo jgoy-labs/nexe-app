@@ -32,6 +32,10 @@ const ALLOWED_PLUGIN_ACTIONS = new Set([
 
 // Registry of trusted iframe.contentWindow references.
 // Call `registerPluginIframe(iframe)` right after you mount `<iframe src="plugin://...">`.
+// NB (MC-039): production does not mount any plugin:// iframe yet. The firewall
+// (postMessage action allowlist) is wired and tested, but no production code
+// calls registerPluginIframe — it is a spike/fixture awaiting the plugin-mount
+// feature, and the allowlist stays inert in prod until that lands.
 const REGISTERED_IFRAME_SOURCES = new Set();
 
 export function registerPluginIframe(iframe) {
@@ -129,9 +133,21 @@ function setStatus(text) {
   if (el) el.textContent = text;
 }
 
-function showError(text) {
-  const el = document.querySelector("#splash-error");
-  if (el) { el.textContent = text; el.style.display = "block"; }
+export function showError(text) {
+  let el = document.querySelector("#splash-error");
+  if (!el) {
+    // MC-037: the splash body may have been cleared (e.g. initOnboarding threw
+    // AFTER document.body.replaceChildren()), so #splash-error no longer exists
+    // and the old `if (el)` guard silently did nothing → blank screen. Rebuild a
+    // minimal, always-visible error element instead of failing silently.
+    el = document.createElement("div");
+    el.id = "splash-error";
+    el.style.cssText =
+      "position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);max-width:80%;font:1rem system-ui;color:#c0392b;text-align:center;white-space:pre-wrap";
+    document.body.appendChild(el);
+  }
+  el.textContent = text;
+  el.style.display = "block";
   setStatus("");
   const spinner = document.querySelector(".spinner");
   if (spinner) spinner.style.display = "none";
@@ -143,7 +159,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     const firstRun = await invoke("check_first_run");
     if (firstRun) {
       const { initOnboarding } = await import("./onboarding/main.js");
-      initOnboarding();
+      // MC-037: await so a throw inside initOnboarding propagates to the catch
+      // below (showError) instead of becoming an unhandled rejection that leaves
+      // a blank screen. Without await the `return` ran before the promise settled.
+      await initOnboarding();
       return;
     }
 
@@ -158,10 +177,11 @@ window.addEventListener("DOMContentLoaded", async () => {
       try {
         await fetchFromSidecar(healthUrl, "GET", null);
         // Sidecar is healthy. Rust `poll_sidecar_health` will navigate the
-        // webview to http://127.0.0.1:{port}/?nexe_api_key=... right after
+        // webview to http://127.0.0.1:{port}/ui/#nexe_api_key=... right after
         // its own health check passes (typically within the next poll tick).
-        // Hold the spinner here; if Rust does not navigate within a small
-        // grace window, surface a timeout below.
+        // The key is passed via URL fragment (not query-param) so it never
+        // appears in access logs (K-001). Hold the spinner here; if Rust does
+        // not navigate within a small grace window, surface a timeout below.
         setStatus("");
         await new Promise((r) => setTimeout(r, 5_000));
         showError("El servidor està actiu però la finestra no ha pogut canviar. Tanca i reobre l'app.");

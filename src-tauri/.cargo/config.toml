@@ -1,22 +1,22 @@
 # Build hygiene — minimize disclosure of the builder's FS paths.
 #
-# `[profile.release] strip = "symbols"` (a `Cargo.toml`) ja elimina DWARF debug
-# info al release binary. El `--remap-path-prefix` següent complementa per a
-# panic backtraces i `RUST_BACKTRACE=1` output.
+# `[profile.release] strip = "symbols"` (in `Cargo.toml`) already strips DWARF debug
+# info from the release binary. The `--remap-path-prefix` below complements it for
+# panic backtraces and `RUST_BACKTRACE=1` output.
 #
-# Si algú executa `strings target/release/nexe-app | grep $HOME`, no ha de
-# retornar rutes del machine builder (casa del dev, CI path, etc.).
+# If someone runs `strings target/release/nexe-app | grep $HOME`, it must not
+# return paths from the builder machine (dev's home, CI path, etc.).
 
-# Rustflags anteriors amb --remap-path-prefix=@CARGO_HOME=@cargo eliminats
-# perquè eren NO-OP (Cargo no expandeix $VAR al config.toml).
-# El remap real (RUSTFLAGS amb $HOME i $CARGO_HOME expandits + SOURCE_DATE_EPOCH):
-#   ./scripts/reproducible-build.sh  ← usar per builds reproduïbles
+# Previous rustflags with --remap-path-prefix=@CARGO_HOME=@cargo removed
+# because they were NO-OP (Cargo does not expand $VAR in config.toml).
+# The real remap (RUSTFLAGS with $HOME and $CARGO_HOME expanded + SOURCE_DATE_EPOCH):
+#   ./scripts/reproducible-build.sh  ← use for reproducible builds
 
-# Nota: les variables com $HOME o $CARGO_HOME NO s'expandeixen al config.toml.
-# Per un build reproduïble amb remap dels paths reals + SOURCE_DATE_EPOCH:
-#   ./scripts/reproducible-build.sh          (des del repo root)
-# Aquest script injecta $HOME, $CARGO_HOME i SOURCE_DATE_EPOCH via RUSTFLAGS
-# abans d'executar cargo build --release.
+# Note: variables like $HOME or $CARGO_HOME are NOT expanded in config.toml.
+# For a reproducible build with remapping of the real paths + SOURCE_DATE_EPOCH:
+#   ./scripts/reproducible-build.sh          (from the repo root)
+# This script injects $HOME, $CARGO_HOME and SOURCE_DATE_EPOCH via RUSTFLAGS
+# before running cargo build --release.
 #
-# SLSA maturity: baseline (L1-equivalent). Veure ADR-0015 per path cap a L3
+# SLSA maturity: baseline (L1-equivalent). See ADR-0015 for the path to L3
 # (sigstore + attested builder + bundle reproducibility).

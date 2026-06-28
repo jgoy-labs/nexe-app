@@ -49,40 +49,97 @@ pub fn check_partial_install(app: AppHandle) -> bool {
 /// Errors are silently ignored — worst case the wizard shows again.
 #[tauri::command]
 pub fn reset_installation(app: AppHandle) {
-    reset_installation_inner(&app, false);
+    // Errors are silently ignored — worst case the wizard shows again, which
+    // is a safe degradation for a non-destructive reset.
+    let _ = reset_installation_inner(&app, false);
+}
+
+/// Outcome of an uninstall/reset sweep.
+///
+/// B058: the previous code discarded every `remove_*` error with `let _ = …`
+/// and the tray handler then logged "uninstall complete" unconditionally, so a
+/// failed wipe (permissions, file locked, path is a file) left data on disk
+/// while telling the user it was gone. We now collect per-path failures so the
+/// caller can report honestly. A missing path (`NotFound`) is NOT a failure —
+/// it just means there was nothing to remove (idempotent).
+#[derive(Debug, Default)]
+pub struct UninstallReport {
+    /// Human-readable `"<path>: <error>"` for each removal that genuinely failed.
+    pub failures: Vec<String>,
+}
+
+impl UninstallReport {
+    /// `true` when every removal succeeded or had nothing to remove.
+    pub fn all_ok(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+fn remove_file_tracked(report: &mut UninstallReport, path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => report.failures.push(format!("{}: {e}", path.display())),
+    }
+}
+
+fn remove_dir_tracked(report: &mut UninstallReport, path: &std::path::Path) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => report.failures.push(format!("{}: {e}", path.display())),
+    }
 }
 
 /// Full uninstall: removes onboarding state, extracted bundle, downloaded
 /// models, AND WebKit localStorage so the wizard starts fresh on next launch.
 /// Called from the tray "Uninstall" menu item.
-pub fn full_uninstall(app: &AppHandle) {
-    reset_installation_inner(app, true);
+///
+/// B058: returns an [`UninstallReport`] so the caller can tell the user the
+/// truth instead of claiming success unconditionally. The caller MUST kill the
+/// sidecar BEFORE calling this — otherwise the live process keeps writing to
+/// `storage`/`vectors` while we delete them (SQLite/Qdrant corruption, or
+/// re-created files racing the wipe).
+pub fn full_uninstall(app: &AppHandle) -> UninstallReport {
+    reset_installation_inner(app, true)
 }
 
-fn reset_installation_inner(app: &AppHandle, full: bool) {
+fn reset_installation_inner(app: &AppHandle, full: bool) -> UninstallReport {
     let config_dir = app.path().app_config_dir().unwrap_or_default();
     let data_dir = app.path().app_data_dir().unwrap_or_default();
-    let _ = std::fs::remove_file(config_dir.join("onboarding_complete"));
-    let _ = std::fs::remove_file(
-        data_dir
+    reset_paths(&config_dir, &data_dir, full)
+}
+
+/// Pure removal sweep (no `AppHandle`) so the failure-tracking logic is unit
+/// testable without a Tauri runtime.
+fn reset_paths(
+    config_dir: &std::path::Path,
+    data_dir: &std::path::Path,
+    full: bool,
+) -> UninstallReport {
+    let mut report = UninstallReport::default();
+    remove_file_tracked(&mut report, &config_dir.join("onboarding_complete"));
+    remove_file_tracked(
+        &mut report,
+        &data_dir
             .join("sidecar")
             .join("data")
             .join("onboarding_state.json"),
     );
-    let _ = std::fs::remove_file(data_dir.join("sidecar").join(".extracted"));
+    remove_file_tracked(&mut report, &data_dir.join("sidecar").join(".extracted"));
 
     if full {
         let sidecar = data_dir.join("sidecar");
-        let _ = std::fs::remove_dir_all(sidecar.join("data").join("models"));
-        let _ = std::fs::remove_dir_all(sidecar.join("vectors"));
-        let _ = std::fs::remove_dir_all(sidecar.join("storage"));
+        remove_dir_tracked(&mut report, &sidecar.join("data").join("models"));
+        remove_dir_tracked(&mut report, &sidecar.join("vectors"));
+        remove_dir_tracked(&mut report, &sidecar.join("storage"));
 
         // WebView storage (localStorage/IndexedDB) lives outside the app data
         // dir, in a platform-specific WebKit location keyed by bundle id.
         #[cfg(target_os = "macos")]
         if let Ok(home) = std::env::var("HOME") {
             let webkit = std::path::PathBuf::from(&home).join("Library/WebKit/com.nexe.app");
-            let _ = std::fs::remove_dir_all(&webkit);
+            remove_dir_tracked(&mut report, &webkit);
         }
 
         // WebKitGTK stores its data under XDG data home, which `dirs::data_local_dir()`
@@ -91,9 +148,10 @@ fn reset_installation_inner(app: &AppHandle, full: bool) {
         #[cfg(target_os = "linux")]
         if let Some(local) = dirs::data_local_dir() {
             let webkit = local.join("com.nexe.app");
-            let _ = std::fs::remove_dir_all(&webkit);
+            remove_dir_tracked(&mut report, &webkit);
         }
     }
+    report
 }
 
 /// Return the path of the first-run flag file (pure, testable helper).
@@ -241,5 +299,56 @@ mod tests {
         let data = TempDir::new().unwrap();
         // Must not panic when files are absent.
         do_reset(cfg.path(), data.path());
+    }
+
+    // ── B058: full_uninstall failure tracking (reset_paths) ────────────────
+
+    #[test]
+    fn uninstall_report_ok_when_everything_removed() {
+        let cfg = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        write_flag(cfg.path());
+        write_extracted(data.path());
+        let report = super::reset_paths(cfg.path(), data.path(), true);
+        assert!(
+            report.all_ok(),
+            "clean removal must report ok, got: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn uninstall_report_ok_when_nothing_to_remove() {
+        // Missing paths => NotFound => NOT a failure (idempotent).
+        let cfg = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let report = super::reset_paths(cfg.path(), data.path(), true);
+        assert!(
+            report.all_ok(),
+            "absent files must not count as failures, got: {:?}",
+            report.failures
+        );
+    }
+
+    #[test]
+    fn uninstall_report_records_real_failure() {
+        // `storage` exists as a FILE, so remove_dir_all errors with a non-NotFound
+        // kind and must be recorded — proving we no longer silently swallow it.
+        let cfg = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        let sidecar = data.path().join("sidecar");
+        fs::create_dir_all(&sidecar).unwrap();
+        fs::write(sidecar.join("storage"), b"not-a-dir").unwrap();
+
+        let report = super::reset_paths(cfg.path(), data.path(), true);
+        assert!(
+            !report.all_ok(),
+            "remove_dir_all on a regular file must be a recorded failure"
+        );
+        assert!(
+            report.failures.iter().any(|f| f.contains("storage")),
+            "failure list must name the offending path, got: {:?}",
+            report.failures
+        );
     }
 }

@@ -6,6 +6,8 @@
 
 Contracte entre el frontend de `nexe-app` (Tauri webview) i el backend `server-nexe` (Python FastAPI, port 8000). Defineix els endpoints mínims que han d'existir per a que l'app arranqui, mostri estat i acabi net.
 
+> **Estat d'implementació (v1.0.6):** d'aquests 7 endpoints, **2 estan implementats** tal com es documenten (`/health`, `/v1/chat/completions`) i 1 més existeix amb **ruta divergent** (graceful shutdown, real a `/admin/system/shutdown`). Els altres 4 (`/v1/meta/compatibility`, `/v1/plugins/registry` i els 2 WebSockets) són **planned** — encara no existeixen al backend. Vegeu la columna *Estat* a la taula resum. Aquest document descriu el contracte de disseny, no l'estat actual complet.
+
 ---
 
 ## Convencions
@@ -77,15 +79,15 @@ Inicialment TOTS els endpoints requereixen auth. Si es detecten casos on no és 
 
 ## Taula resum
 
-| # | Tipus | Path | Ús | Fase |
+| # | Tipus | Path | Ús | Estat (v1.0.6) |
 |---|---|---|---|---|
-| 1 | GET | `/health` | Splash screen, "alive check" | 0 |
-| 2 | GET | `/v1/meta/compatibility` | Version check app ↔ backend | 0 |
-| 3 | POST | `/v1/chat/completions` | Chat OpenAI-compatible | 0 |
-| 4 | GET | `/v1/plugins/registry` | Catàleg plugins amb metadata UI | 0 |
-| 5 | POST | `/api/v1/system/shutdown` | Graceful shutdown abans de kill | 0 |
-| 6 | WS | `/v1/chat/stream` | Streaming tokens LLM | 0 |
-| 7 | WS | `/v1/events` | Events lifecycle + `plugin.registry.changed` | 0 |
+| 1 | GET | `/health` | Splash screen, "alive check" | ✅ implementat |
+| 2 | GET | `/v1/meta/compatibility` | Version check app ↔ backend | ❌ planned (no existeix) |
+| 3 | POST | `/v1/chat/completions` | Chat OpenAI-compatible | ✅ implementat |
+| 4 | GET | `/v1/plugins/registry` | Catàleg plugins amb metadata UI | ❌ planned (no existeix) |
+| 5 | POST | `/admin/system/shutdown` | Graceful shutdown abans de kill | ✅ implementat (ruta real; el doc deia `/api/v1/system/shutdown`) |
+| 6 | WS | `/v1/chat/stream` | Streaming tokens LLM | ❌ planned (cap WebSocket al backend) |
+| 7 | WS | `/v1/events` | Events lifecycle + `plugin.registry.changed` | ❌ planned (cap WebSocket al backend) |
 
 ---
 
@@ -249,7 +251,9 @@ Sense body.
 
 ---
 
-## 5. `POST /api/v1/system/shutdown`
+## 5. `POST /admin/system/shutdown`
+
+> **Ruta real:** `/admin/system/shutdown` (router admin, `system.py`). Aquest document deia originalment `/api/v1/system/shutdown` — corregit a la ruta implementada.
 
 Graceful shutdown del backend. Tauri crida aquest endpoint abans de matar el procés sidecar, perquè Qdrant i SQLite puguin tancar sessions netament.
 

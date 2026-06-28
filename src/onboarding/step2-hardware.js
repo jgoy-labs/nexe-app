@@ -14,6 +14,34 @@ import { t } from "./i18n.js";
 // into their browser. Lower-friction than asking the user to type it.
 const HF_TOKENS_URL = "https://huggingface.co/settings/tokens";
 
+// MC-036: the outside-click handler was attached to `document` on EVERY dropdown
+// render and never removed, so re-rendering Step 2 (theme/lang/back-forward)
+// stacked N global click listeners, each closing over a stale dropdown. We instead
+// install ONE delegated listener at module scope (idempotent) that closes any open
+// `.custom-dropdown` when clicking outside it. Event delegation means zero
+// accumulation across renders AND correct behaviour with several simultaneous
+// dropdowns (a per-render AbortController would detach sibling dropdowns).
+let _outsideClickInstalled = false;
+
+// Test-only reset of the install latch (see blocb-frontend.test.js).
+export function _resetOutsideClickForTest() {
+  _outsideClickInstalled = false;
+}
+
+function _ensureOutsideClickListener() {
+  if (_outsideClickInstalled) return;
+  _outsideClickInstalled = true;
+  document.addEventListener("click", (e) => {
+    document.querySelectorAll(".custom-dropdown").forEach((wrap) => {
+      if (wrap.contains(e.target)) return;
+      const list = wrap.querySelector(".custom-dropdown-list");
+      const arrow = wrap.querySelector(".dropdown-arrow");
+      if (list) list.style.display = "none";
+      if (arrow) arrow.textContent = "▾";
+    });
+  });
+}
+
 // ── Helpers ───────────────────────────────────────────────────
 
 // Origin → flag emoji. Lookup table instead of chained includes so the
@@ -111,6 +139,27 @@ function _filterBackendsByMetal(backends) {
   return (backends || []).filter((b) => metalOK || b.toLowerCase() !== "mlx");
 }
 
+// B054: does the current selection need an HF token at download time? Only
+// HF-hosted gated repos pulled via mlx/gguf — Ollama pulls the same model
+// from its own registry with no token. Exported for unit testing.
+export function _modelNeedsToken(sel) {
+  return !!(sel && sel.gated && sel.engine !== "ollama");
+}
+
+// Show/hide the normal-zone HF token block to match the current selection,
+// so basic users picking a non-gated model never see it but a gated MLX pick
+// surfaces the input. Safe to call when the slot is absent (advanced zone).
+function _updateTokenSlotVisibility() {
+  const slot = document.getElementById("hf-token-slot");
+  if (!slot) return;
+  const needs = _modelNeedsToken(state.selectedModel);
+  slot.style.display = needs ? "" : "none";
+  // Rebuild the block so a gated pick shows an OPEN, "required" token input the
+  // user can't overlook; a non-gated pick collapses back to the optional form.
+  // _buildHfTokenBlock reads state.hfToken, so the typed value is preserved.
+  slot.replaceChildren(_buildHfTokenBlock({ open: needs, required: needs }));
+}
+
 function _renderNormalZone(zone) {
   const usable = state.hardware.ram_gb * 0.55;
   // Map instead of filter — show ALL models but flag
@@ -131,6 +180,17 @@ function _renderNormalZone(zone) {
   // Dropdown custom
   const dropdown = _buildCustomDropdown(shown);
   zone.appendChild(dropdown);
+
+  // B054: gated HF models (mlx/gguf) need a token at download time. The block
+  // lives here collapsed and only shows when the current selection needs it
+  // (toggled by the dropdown selection + engine-cycle handlers). Reuses the
+  // same _buildHfTokenBlock as Advanced; the token stays in memory only.
+  const tokenSlot = document.createElement("div");
+  tokenSlot.id = "hf-token-slot";
+  const needsToken = _modelNeedsToken(state.selectedModel);
+  tokenSlot.appendChild(_buildHfTokenBlock({ open: needsToken, required: needsToken }));
+  tokenSlot.style.display = needsToken ? "" : "none";
+  zone.appendChild(tokenSlot);
 
   const dlBtn = document.createElement("button");
   dlBtn.className = "btn-primary btn-full";
@@ -181,8 +241,11 @@ function _buildEngineBadge(model, availableBackends, primaryEngine, isDisabled) 
         engine: newEngine,
         model_id: _deriveModelId(model, newEngine),
         disk_gb: model.disk_gb,
+        gated: !!model.gated,
       };
       saveState();
+      // Cycling a gated model MLX↔Ollama flips whether a token is needed.
+      _updateTokenSlotVisibility();
     }
   });
   return engineBadge;
@@ -273,13 +336,22 @@ function _renderDropdownItem(model, { listWrap, triggerText, arrow }) {
   // Disabled models cannot be selected.
   if (!isDisabled) {
     item.addEventListener("click", () => {
+      // MC-063: recompute engine + model_id at click time. Cycling the
+      // engine badge mutates `model._currentEngine` without re-rendering the row,
+      // so the render-time `primaryEngine`/`modelId` may be stale — reading them
+      // here would silently revert the selection to the pre-cycle engine.
+      const clickEngine = (model._currentEngine || availableBackends[0])
+        .toLowerCase().replace("llama.cpp", "gguf");
+      const clickModelId = _deriveModelId(model, clickEngine);
       state.selectedModel = {
         name: model.name,
-        engine: primaryEngine,
-        model_id: modelId,
+        engine: clickEngine,
+        model_id: clickModelId,
         disk_gb: model.disk_gb,
+        gated: !!model.gated,
       };
       saveState();
+      _updateTokenSlotVisibility();
       triggerText.textContent = model.name;
       triggerText.className = "dropdown-selected-text";
       listWrap.style.display = "none";
@@ -294,7 +366,7 @@ function _renderDropdownItem(model, { listWrap, triggerText, arrow }) {
   return item;
 }
 
-function _buildCustomDropdown(models) {
+export function _buildCustomDropdown(models) {
   const wrap = document.createElement("div");
   wrap.className = "custom-dropdown";
   wrap.setAttribute("tabindex", "0");
@@ -330,13 +402,9 @@ function _buildCustomDropdown(models) {
     arrow.textContent = open ? "▾" : "▴";
   });
 
-  // Close when clicking outside
-  document.addEventListener("click", (e) => {
-    if (!wrap.contains(e.target)) {
-      listWrap.style.display = "none";
-      arrow.textContent = "▾";
-    }
-  }, { once: false });
+  // Close when clicking outside — handled by the single delegated listener
+  // installed once at module scope (MC-036), so renders never stack listeners.
+  _ensureOutsideClickListener();
 
   wrap.appendChild(trigger);
   wrap.appendChild(listWrap);
@@ -418,12 +486,18 @@ function _renderAdvancedZone(zone) {
 
 // ── HF Token block ──────────────────────────────────────
 
-function _buildHfTokenBlock() {
+export function _buildHfTokenBlock(opts = {}) {
+  const { open = false, required = false } = opts;
   const details = document.createElement("details");
   details.className = "hf-token-block";
+  // B054: a gated selection opens the block and labels it required so the user
+  // cannot miss the token input and end up stuck at the gated download.
+  details.open = open;
 
   const summary = document.createElement("summary");
-  summary.textContent = t("hf_section_label", state.lang);
+  summary.textContent = required
+    ? t("hf_section_label_required", state.lang)
+    : t("hf_section_label", state.lang);
   details.appendChild(summary);
 
   const hint = document.createElement("p");

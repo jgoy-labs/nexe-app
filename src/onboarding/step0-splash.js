@@ -1,9 +1,11 @@
 // Step 0 — Splash / extraction progress.
 //
 // Shown while the sidecar bundle is being extracted on first launch.
-// Listens for "extract-progress" Tauri events emitted by lib.rs.
-// If no event arrives within 600 ms (bundle already extracted) transitions
-// directly to Step 1.
+// MC-059: NO Rust code emits "extract-progress" today — extraction
+// (ensure_sidecar_extracted) runs synchronously in setup_services before the
+// webview loads, so it cannot report progress to the listener below with the
+// current architecture. The listener is forward-compat scaffolding; in practice
+// the splash advances on the 600 ms quick timer (indeterminate bar until then).
 
 import { listen } from "@tauri-apps/api/event";
 import { goToStep, state } from "./main.js";
@@ -24,12 +26,29 @@ export async function step0() {
   const bar = document.createElement("progress");
   bar.className = "splash-bar";
   bar.max = 100;
-  bar.value = 0;
+  // MC-059: no initial value → indeterminate animated bar (nothing emits
+  // 'extract-progress' today; the listener below sets bar.value only if a real
+  // emitter is ever wired, turning it determinate).
   wrapper.appendChild(bar);
 
   app.appendChild(wrapper);
 
   let received = false;
+  let settled = false;
+  let quickTimer;
+  let absoluteTimer;
+
+  // Single transition out of the splash: unlisten, clear both timers, advance.
+  // Idempotent so the progress event, the quick timer and the absolute ceiling
+  // can never double-fire goToStep or leave the listener orphaned (MC-038).
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(quickTimer);
+    clearTimeout(absoluteTimer);
+    unlisten();
+    goToStep(1);
+  };
 
   const unlisten = await listen("extract-progress", (event) => {
     received = true;
@@ -37,17 +56,17 @@ export async function step0() {
     const stage = event.payload?.stage;
     bar.value = pct;
     if (stage) msg.textContent = stage;
-    if (pct >= 100) {
-      unlisten();
-      goToStep(1);
-    }
+    if (pct >= 100) settle();
   });
 
-  // If bundle was already extracted no event will arrive — skip after 600 ms.
-  setTimeout(() => {
-    if (!received) {
-      unlisten();
-      goToStep(1);
-    }
+  // If the bundle was already extracted no event will arrive — skip after 600 ms.
+  quickTimer = setTimeout(() => {
+    if (!received) settle();
   }, 600);
+
+  // MC-038: absolute ceiling INDEPENDENT of `received`. If progress events start
+  // but stall below 100% (extraction hung/crashed), the 600 ms quick timer never
+  // fires (received === true) and the old code left the splash and the listener
+  // hanging forever. This hard cap always advances so the user is never stuck.
+  absoluteTimer = setTimeout(() => settle(), 120000);
 }

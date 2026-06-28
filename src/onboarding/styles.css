@@ -734,6 +734,37 @@ p {
   min-height: 1.2em;
 }
 
+/* ── Non-blocking install warnings (INST-002-FE) ─── */
+
+.step3-warnings {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.download-warning {
+  margin: 0;
+  color: var(--text-warn);
+  font-size: 0.8rem;
+  font-family: var(--font-mono);
+}
+
+.sha-warning-banner {
+  border: 1px solid var(--text-warn);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.9rem;
+  margin-top: 0.75rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.sha-warning-banner p {
+  margin: 0;
+  color: var(--text-warn);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
 .download-info {
   font-size: 0.8rem;
   font-family: var(--font-mono);

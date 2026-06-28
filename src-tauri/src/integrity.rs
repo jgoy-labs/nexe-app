@@ -366,7 +366,8 @@ pub(crate) fn verify_and_load_plugin_asset(
     let manifest_path = plugin_dir.join("manifest.toml");
     if let Ok(content) = std::fs::read_to_string(&manifest_path) {
         if let IntegrityFormat::PerFile(_) = detect_integrity_format(&content) {
-            let files_map = verify_manifest_integrity(&plugin_dir)?;
+            // B163: reuse the `content` already read above instead of a 2nd FS read.
+            let files_map = verify_manifest_integrity_from_str(&content)?;
             return verify_and_load_file_asset_per_file(
                 &plugin_dir,
                 requested_rel_path,
@@ -577,13 +578,21 @@ pub fn detect_integrity_format(content: &str) -> IntegrityFormat {
 pub fn verify_manifest_integrity(plugin_dir: &Path) -> Result<HashMap<String, String>, u16> {
     let manifest_path = plugin_dir.join("manifest.toml");
     let content = std::fs::read_to_string(&manifest_path).map_err(|_| 403_u16)?;
+    verify_manifest_integrity_from_str(&content)
+}
 
-    let IntegrityFormat::PerFile(manifest_files) = detect_integrity_format(&content) else {
+/// B163: verify a manifest already read into memory. The GET path detects the
+/// format from a first read; reusing that content here avoids a second FS read
+/// (and the TOCTOU window where a concurrent writer could change the manifest
+/// between the two reads → a verified `files_map` diverging from the detected
+/// format). Worst case of the old double-read was a spurious 403 (fail-closed).
+pub fn verify_manifest_integrity_from_str(content: &str) -> Result<HashMap<String, String>, u16> {
+    let IntegrityFormat::PerFile(manifest_files) = detect_integrity_format(content) else {
         return Err(403); // caller should only call this for per-file manifests
     };
 
     // Verify manifest_sha256
-    let parsed: toml::Value = toml::from_str(&content).map_err(|_| 403_u16)?;
+    let parsed: toml::Value = toml::from_str(content).map_err(|_| 403_u16)?;
     let stored_hash = parsed
         .get("integrity")
         .and_then(|i| i.get("manifest_sha256"))
@@ -594,7 +603,7 @@ pub fn verify_manifest_integrity(plugin_dir: &Path) -> Result<HashMap<String, St
         return Err(403);
     }
 
-    let actual_hash = compute_manifest_hash(&content)?;
+    let actual_hash = compute_manifest_hash(content)?;
     if actual_hash != stored_hash {
         return Err(403);
     }
@@ -604,7 +613,9 @@ pub fn verify_manifest_integrity(plugin_dir: &Path) -> Result<HashMap<String, St
 
 /// Load a single file asset with per-file integrity verification (B5 atomic per-file).
 ///
-/// Opens fd(manifest) and fd(requested_file) BEFORE any read — eliminates TOCTOU.
+/// `files_map` is the already-verified manifest mapping (integrity checked by the
+/// caller). Opens fd(requested_file) BEFORE read — inode pinned against external
+/// rename/unlink. The manifest is NOT re-read here.
 /// Returns `Ok(bytes)` only if the bytes match the hash in the verified manifest.
 fn verify_and_load_file_asset_per_file(
     plugin_dir: &Path,

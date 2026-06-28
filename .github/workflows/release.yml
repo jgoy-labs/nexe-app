@@ -59,6 +59,13 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
+      # B143: version-sync gate (mirall de check.yml:37-39). Fail-fast abans del
+      # build car. --skip-server-nexe perquè el quality-gate només fa checkout de
+      # nexe-app → les 3 fonts internes (package.json/Cargo.toml/tauri.conf.json).
+      - name: version sync check (3 fonts internes nexe-app)
+        shell: bash
+        run: bash scripts/check-version-sync.sh --skip-server-nexe
+
       - name: Install Linux WebKitGTK deps
         run: |
           sudo apt-get update
@@ -234,6 +241,12 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Tauri build (release, unsigned)
+        # B053: this is `tauri build`, NOT `tauri:build` — it does not run
+        # pre-bundle-sidecar.sh, and CI has no Python build env (see
+        # weekly-bundle-smoke.yml), so the artifact does NOT embed a functional
+        # Python sidecar. This pipeline is a COMPILATION/VERIFICATION GATE, not
+        # the distribution channel: the shipped product is a locally-signed,
+        # notarized DMG built out-of-band (see SECURITY.md › Release pipeline).
         run: pnpm tauri build --target ${{ matrix.platform.target }}
 
       - name: List artifacts
@@ -366,6 +379,8 @@ jobs:
 
             Binaris construits SENSE signatura Apple ni Authenticode Windows.
             No recomanem instal·lar-los en produccio. Contacta el maintainer si necessites una build signada per testing intern.
+
+            Aquests artefactes **no inclouen el sidecar Python funcional** (aquest pipeline no el construeix) i serveixen com a **gate de verificacio de compilacio**, no com a canal de distribucio. La build oficial es un **DMG signat i notaritzat** generat localment (B053).
 
             ### Verificacio integritat
 

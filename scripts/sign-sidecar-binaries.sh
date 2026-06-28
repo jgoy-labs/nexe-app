@@ -5,26 +5,26 @@
 # ID certificate, secure timestamp, and hardened runtime.
 #
 # Initial scope: target/sidecar/venv (333 Mach-O wheels + libs).
-# Later (2026-05-18): scope expanded to target/sidecar/ complet — inclou
-# python-runtime/ (PBS copiat dins el bundle): bin/python3.12 + ~45-55 .so
-# de lib-dynload (ssl, socket, hashlib, ctypes, sqlite3, ...). codesign
-# --force substitueix la signatura CMS upstream del PBS per la nostra
-# Developer ID — comportament correcte per a notarytool Apple, que exigeix
-# que tots els Mach-O del bundle estiguin signats amb la mateixa identity
-# que l'app. Sense aquesta expansió, el python3.12 del PBS quedaria
-# amb signatura CMS upstream que Gatekeeper accepta peró notarytool no
-# valida com a part del nostre Developer ID team.
+# Later (2026-05-18): scope expanded to the full target/sidecar/ — includes
+# python-runtime/ (PBS copied into the bundle): bin/python3.12 + ~45-55 .so
+# from lib-dynload (ssl, socket, hashlib, ctypes, sqlite3, ...). codesign
+# --force replaces the upstream CMS signature of the PBS with our
+# Developer ID — correct behaviour for Apple notarytool, which requires
+# all the Mach-O in the bundle to be signed with the same identity
+# as the app. Without this expansion, the PBS python3.12 would be left
+# with the upstream CMS signature that Gatekeeper accepts but notarytool does
+# not validate as part of our Developer ID team.
 #
-# Why: el PBS venv conté centenars de .so/.dylib signats ad-hoc
-# pels autors dels wheels (o no signats). Apple notarization rebutja tot
-# el .app si qualsevol Mach-O annidat no porta Developer ID + timestamp +
+# Why: the PBS venv contains hundreds of .so/.dylib signed ad-hoc
+# by the wheel authors (or unsigned). Apple notarization rejects the whole
+# .app if any nested Mach-O lacks Developer ID + timestamp +
 # hardened runtime. A failed submission listed _miniaudio.abi3.so,
 # _cffi_backend, mmh3, and dozens more nested Mach-O files as issues.
 #
-# Difference vs server-nexe legacy `sign-wheels-bundle.sh`: aquell operava
-# sobre .whl files (unpack → sign → repack amb sha256 RECORD). Aquí el
-# venv ja està extret (PBS+uv install), només cal caminar el bundle i
-# signar in-place — sense round-trip zip.
+# Difference vs server-nexe legacy `sign-wheels-bundle.sh`: that one operated
+# on .whl files (unpack → sign → repack with sha256 RECORD). Here the
+# venv is already extracted (PBS+uv install), we just need to walk the bundle and
+# sign in-place — no zip round-trip.
 #
 # Usage:
 #   APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -71,20 +71,26 @@ START=$(date +%s)
 # Candidate files: .so, .dylib, anything with exec bit (catches torch's
 # protoc, torch_shm_manager, PBS python3.12 binary, etc.).
 # Filter actual Mach-O via `file` magic (skips shell scripts, .pyc, text).
-# find ara cobreix $SIDECAR_DIR complet — venv/ + python-runtime/
-# (PBS). Veure header per justificació.
+# find now covers the full $SIDECAR_DIR — venv/ + python-runtime/
+# (PBS). See the header for justification.
 while IFS= read -r -d '' f; do
     if ! file "$f" 2>/dev/null | grep -q "Mach-O"; then
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
     TOTAL=$((TOTAL + 1))
+    # B140: a binary that signs (exit 0) but fails --verify --strict (inconsistent
+    # metadata) would otherwise pass as SIGNED here and only blow up at notarytool.
+    # Fold the post-signature verify into the same gate so it counts as FAILED and
+    # trips the existing abort below. Per-file (not sampling) is correct; ~2× codesign
+    # calls on a script that already takes 1-3 min. No spctl on flat dylibs (wrong tool).
     if codesign --force --options=runtime --timestamp \
-            --sign "$APPLE_SIGNING_IDENTITY" "$f" >/dev/null 2>&1; then
+            --sign "$APPLE_SIGNING_IDENTITY" "$f" >/dev/null 2>&1 \
+        && codesign --verify --strict "$f" >/dev/null 2>&1; then
         SIGNED=$((SIGNED + 1))
     else
         FAILED=$((FAILED + 1))
-        echo "    sign failed: ${f#"$SIDECAR_DIR/"}" >&2
+        echo "    sign/verify failed: ${f#"$SIDECAR_DIR/"}" >&2
     fi
 done < <(find "$SIDECAR_DIR" -type f \
     \( -name "*.so" -o -name "*.dylib" -o -perm +111 \) \

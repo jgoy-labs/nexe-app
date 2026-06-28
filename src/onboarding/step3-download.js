@@ -84,6 +84,21 @@ function _streamErrorResult(stall, err) {
   return { ok: false, message: t("step3_connection_lost", state.lang) + ": " + err.message };
 }
 
+/**
+ * INST-002-FE: render a non-blocking warning line into the step3 warnings
+ * container (yellow ⚠, parity with the CLI). Today's only warning is
+ * SHA256_NOT_PINNED (model installed without weight verification); the message
+ * is localised here rather than echoing the backend's English `data.message`.
+ * The download keeps going — this only informs.
+ */
+function _renderShaWarning(data, container) {
+  const model = state.selectedModel?.name || "";
+  const line = document.createElement("p");
+  line.className = "download-warning";
+  line.textContent = "⚠ " + (model ? model + ": " : "") + t("step3_sha_warning", state.lang);
+  container.appendChild(line);
+}
+
 /** Render a `progress` SSE event into the bar + info widgets. */
 function _applyProgress(data, bar, info) {
   const pct = Math.round(data.percent ?? 0);
@@ -103,14 +118,18 @@ function _safeCancel(reader) {
 /**
  * Parse and act on a single SSE frame. Updates the progress widgets in place.
  * Returns a terminal result (`{ok}`) for `done`/`error`, or `null` to keep
- * reading (keepalive, progress, or unparsable frame). Exported for testing.
+ * reading (keepalive, progress, warning, or unparsable frame). Exported for
+ * testing.
  *
  * @param {string} frame
  * @param {HTMLProgressElement} bar
  * @param {HTMLElement} info
  * @param {ReadableStreamDefaultReader} reader
+ * @param {(data: object) => void} [onWarning]  INST-002-FE: invoked for a
+ *        non-blocking `warning` frame (e.g. SHA256_NOT_PINNED) so the caller can
+ *        surface it. Optional — when absent the warning is simply not rendered.
  */
-export function _handleSseFrame(frame, bar, info, reader) {
+export function _handleSseFrame(frame, bar, info, reader, onWarning) {
   const dataLine = frame.split("\n").find(l => l.startsWith("data: "));
   if (!dataLine) return null;
   let data;
@@ -120,22 +139,30 @@ export function _handleSseFrame(frame, bar, info, reader) {
     case "progress":
       _applyProgress(data, bar, info);
       return null;
+    case "warning":
+      // INST-002-FE: a non-blocking notice (e.g. SHA256_NOT_PINNED). Surface it
+      // to the user (parity with the CLI's yellow ⚠) but keep reading — the
+      // download still completes and a `done`/`error` frame follows.
+      if (onWarning) onWarning(data);
+      return null;
     case "done":
       _safeCancel(reader);
       bar.value = 100;
       return { ok: true };
     case "error":
       _safeCancel(reader);
-      return { ok: false, message: data.message || t("step3_error", state.lang) };
+      // Propagate the structured error code (e.g. GATED_NO_TOKEN) so step3 can
+      // offer a real way out instead of a Retry that just repeats the error.
+      return { ok: false, message: data.message || t("step3_error", state.lang), code: data.code };
     default:
       return null;  // keepalive or unknown type — keep reading
   }
 }
 
 /** Walk the SSE frames in a chunk; return the first terminal result, or null. */
-function _consumeFrames(frames, bar, info, reader) {
+function _consumeFrames(frames, bar, info, reader, onWarning) {
   for (const frame of frames) {
-    const result = _handleSseFrame(frame, bar, info, reader);
+    const result = _handleSseFrame(frame, bar, info, reader, onWarning);
     if (result) return result;
   }
   return null;
@@ -149,9 +176,11 @@ function _consumeFrames(frames, bar, info, reader) {
  * @param {HTMLProgressElement} bar
  * @param {HTMLElement} info
  * @param {AbortController} abortCtrl
+ * @param {(data: object) => void} [onWarning]  forwarded to `_handleSseFrame`
+ *        for non-blocking `warning` frames (INST-002-FE).
  * @returns {Promise<{ok: true} | {ok: false, message: string}>}
  */
-async function _streamDownload(url, bar, info, abortCtrl) {
+async function _streamDownload(url, bar, info, abortCtrl, onWarning) {
   const stall = _createStallController(abortCtrl);
 
   let response;
@@ -192,18 +221,54 @@ async function _streamDownload(url, bar, info, abortCtrl) {
       const frames = buf.split("\n\n");
       buf = frames.pop() ?? "";
 
-      const result = _consumeFrames(frames, bar, info, reader);
+      const result = _consumeFrames(frames, bar, info, reader, onWarning);
       if (result) return result;
     }
-    return bar.value >= 100 ? { ok: true } : { ok: false, message: t("step3_error", state.lang) };
+    // Reaching here means the HTTP stream closed (reader `done`) WITHOUT a
+    // terminal `done`/`error` SSE frame — a successful transfer always returns
+    // earlier via `_handleSseFrame` ("done" → {ok:true}). `bar.value` may read
+    // 100 from the last `progress` frame, but without a `done` frame the
+    // download never confirmed completion → treat a truncated stream as failure.
+    return { ok: false, message: t("step3_error", state.lang) };
   } finally {
     stall.disarm();
   }
 }
 
+/**
+ * B054: hand the HF token to the sidecar BEFORE a gated download so the gated
+ * preflight + snapshot_download authenticate. The token travels in a POST
+ * body (never a query param → not in the access log). On failure it renders
+ * the error + Retry and returns false so the caller aborts the download.
+ *
+ * @returns {Promise<boolean>} true if the token was accepted (or none needed).
+ */
+export async function _handOverHfToken(port, token, errorEl, cancelBtn, retryBtn) {
+  try {
+    const r = await fetch(`http://127.0.0.1:${port}/installer/hf-token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token }),
+    });
+    if (r.ok) return true;
+    errorEl.textContent =
+      (t("step3_token_failed", state.lang) || "Could not set the Hugging Face token") +
+      `: HTTP ${r.status}`;
+  } catch (err) {
+    errorEl.textContent = t("step3_connection_lost", state.lang) + ": " + err.message;
+  }
+  cancelBtn.style.display = "none";
+  retryBtn.style.display = "";
+  return false;
+}
+
 export async function step3() {
   const app = document.getElementById("onboarding-app");
   app.replaceChildren();
+
+  // INST-002-FE: fresh attempt — clear any SHA256 warnings from a prior
+  // download so a Retry (which re-runs step3) doesn't show stale notices.
+  state.shaWarnings = [];
 
   const wrapper = document.createElement("div");
   wrapper.className = "step step3";
@@ -223,6 +288,12 @@ export async function step3() {
   waitHint.className = "step3-wait-hint";
   waitHint.textContent = t("step3_wait_hint", state.lang) || "";
   wrapper.appendChild(waitHint);
+
+  // INST-002-FE: non-blocking warnings (SHA256_NOT_PINNED) accumulate here as
+  // they stream in, below the progress bar.
+  const warningsEl = document.createElement("div");
+  warningsEl.className = "step3-warnings";
+  wrapper.appendChild(warningsEl);
 
   const errorEl = document.createElement("p");
   errorEl.className = "error-msg";
@@ -256,6 +327,14 @@ export async function step3() {
   const port = await invoke("get_sidecar_port");
   const { engine, model_id } = state.selectedModel;
 
+  // B054: a gated HF model (mlx/gguf) needs the token loaded into the sidecar
+  // env before the download streams, or the preflight fails GATED_NO_TOKEN.
+  // Ollama pulls the same model without a token, so skip it there.
+  if (state.selectedModel.gated && engine !== "ollama" && state.hfToken) {
+    const ok = await _handOverHfToken(port, state.hfToken, errorEl, cancelBtn, retryBtn);
+    if (!ok) return;
+  }
+
   // Single AbortController shared by the fetch + the stall watchdog. The
   // backend ThreadPoolExecutor is max_workers=1 so serial downloads here
   // match that contract.
@@ -265,16 +344,33 @@ export async function step3() {
     abortCtrl.abort();
   });
 
+  // INST-002-FE: a SHA256_NOT_PINNED warning frame is non-blocking — record it
+  // (so step4 can recap it) and render it inline while the download continues.
+  const onWarning = (data) => {
+    state.shaWarnings.push({ model: state.selectedModel?.name || "", code: data.code });
+    _renderShaWarning(data, warningsEl);
+  };
+
   // Download the chosen LLM model. Embedder fetch deferred to the sidecar.
   const llmUrl = new URL(`http://127.0.0.1:${port}/installer/download`);
   llmUrl.searchParams.set("engine", engine);
   llmUrl.searchParams.set("model_id", model_id);
-  const llmResult = await _streamDownload(llmUrl.toString(), llmBar, llmInfo, abortCtrl);
+  const llmResult = await _streamDownload(llmUrl.toString(), llmBar, llmInfo, abortCtrl, onWarning);
   if (!llmResult.ok) {
     errorEl.textContent = llmResult.message;
     waitHint.style.display = "none";
     cancelBtn.style.display = "none";
     retryBtn.style.display = "";
+    // B054: a gated model with no/invalid token dead-ends here — Retry alone
+    // would just repeat the error. Offer a way back to the model+token step
+    // (where the required token input now lives).
+    if (llmResult.code === "GATED_NO_TOKEN") {
+      const backBtn = document.createElement("button");
+      backBtn.className = "btn-secondary";
+      backBtn.textContent = t("step3_back_to_select", state.lang) || "← Back to model selection";
+      backBtn.addEventListener("click", () => goToStep(2));
+      actions.appendChild(backBtn);
+    }
     return;
   }
 

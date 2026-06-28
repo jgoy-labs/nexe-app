@@ -319,6 +319,22 @@ describe("initOnboarding — Regression #2 catalog validation on resume", () => 
     expect(found).toBe(true);
     expect(state.step).toBe(4);
   });
+
+  // MC-060 (real regression — invokes the actual _validateResumedModel, unlike
+  // the two theatre tests above which re-implement the catalog check inline):
+  // a resumed engine="local" selection carries a filesystem path as model_id,
+  // which never matches a catalog id. Pre-fix it always reset to Welcome;
+  // reverting the `engine === "local"` early-return turns this test red.
+  it("keeps a resumed engine='local' selection without resetting (calls _validateResumedModel)", async () => {
+    const mod = await import("./main.js?t=" + Date.now() + 60);
+    mod.state.step = 4;
+    mod.state.selectedModel = { engine: "local", model_id: "/Users/x/models/my-gguf", name: "Local model" };
+    mod.state.catalog = [{ name: "Gemma 3 4B", ollama: "gemma3:4b", mlx: null, gguf: null }];
+    await mod._validateResumedModel();
+    expect(mod.state.step).toBe(4);
+    expect(mod.state.selectedModel).not.toBeNull();
+    expect(mod.state.selectedModel.engine).toBe("local");
+  });
 });
 
 describe("model selection in step2", () => {

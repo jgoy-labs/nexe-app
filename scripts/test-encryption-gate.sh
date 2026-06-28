@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# test-encryption-gate.sh — Harness de regressió per a B082 (CRY-01).
+# test-encryption-gate.sh — Regression harness for B082 (CRY-01).
 #
-# Executa el verify-encryption-gate.sh REAL (no una rèplica) contra boot logs
-# fabricats, i comprova que build-sidecar.sh el crida de debò. Si el gate
-# desaparegués o es trenqués, aquest harness es posaria vermell.
+# Runs the REAL verify-encryption-gate.sh (not a replica) against fabricated
+# boot logs, and checks that build-sidecar.sh actually calls it. If the gate
+# disappeared or broke, this harness would go red.
 #
-# Casos:
-#   1. server-nexe + log SENSE el missatge  → exit 1 (abort)        [captura el bug]
-#   2. server-nexe + log AMB el missatge     → exit 0 + "verificat"  [happy path]
-#   3. POC (APP_SOURCE_DIR buit)             → exit 0 (salta)        [no fals positiu]
-#   4. build-sidecar.sh invoca el gate       → connexió present      [no codi mort]
+# Cases:
+#   1. server-nexe + log WITHOUT the message → exit 1 (abort)        [catches the bug]
+#   2. server-nexe + log WITH the message     → exit 0 + "verificat"  [happy path]
+#   3. POC (empty APP_SOURCE_DIR)            → exit 0 (skips)         [no false positive]
+#   4. build-sidecar.sh invokes the gate     → connection present    [no dead code]
 #
-# Ús: ./scripts/test-encryption-gate.sh   (exit 0 = test verd)
+# Usage: ./scripts/test-encryption-gate.sh   (exit 0 = test green)
 
 set -uo pipefail
 
@@ -31,7 +31,7 @@ LOG_BAD="$TMP/boot-bad.log"
 printf 'booting...\nEncryption at rest: ENABLED (AES-256-GCM)\n6 routers ready\n' > "$LOG_OK"
 printf 'booting...\n6 routers ready\n' > "$LOG_BAD"
 
-# ── Cas 1: server-nexe + log sense missatge → ha d'avortar (exit 1) ──
+# ── Case 1: server-nexe + log without the message → must abort (exit 1) ──
 set +e
 OUT1="$("$GATE" "/some/app/dir" "$LOG_BAD" 2>&1)"; EC1=$?
 set -e
@@ -41,7 +41,7 @@ else
     echo "CAS 1 FAIL: esperava exit!=0 + ❌; exit=$EC1 out='$OUT1'"; FAILED=1
 fi
 
-# ── Cas 2 (happy path): server-nexe + log amb missatge → exit 0 ──
+# ── Case 2 (happy path): server-nexe + log with the message → exit 0 ──
 set +e
 OUT2="$("$GATE" "/some/app/dir" "$LOG_OK" 2>&1)"; EC2=$?
 set -e
@@ -51,7 +51,7 @@ else
     echo "CAS 2 FAIL: esperava exit 0 + 'verificat' sense ❌; exit=$EC2 out='$OUT2'"; FAILED=1
 fi
 
-# ── Cas 3: POC (APP_SOURCE_DIR buit) → salta net (exit 0), fins i tot amb log dolent ──
+# ── Case 3: POC (empty APP_SOURCE_DIR) → cleanly skips (exit 0), even with a bad log ──
 set +e
 OUT3="$("$GATE" "" "$LOG_BAD" 2>&1)"; EC3=$?
 set -e
@@ -61,7 +61,7 @@ else
     echo "CAS 3 FAIL: esperava exit 0 silenciós; exit=$EC3 out='$OUT3'"; FAILED=1
 fi
 
-# ── Cas 4: build-sidecar.sh ha de cridar el gate (no codi mort) ──
+# ── Case 4: build-sidecar.sh must call the gate (no dead code) ──
 if grep -q "verify-encryption-gate.sh" "$BUILD"; then
     echo "CAS 4 OK: build-sidecar.sh invoca verify-encryption-gate.sh"
 else

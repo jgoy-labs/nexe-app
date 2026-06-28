@@ -30,7 +30,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "devtools"] }
+tauri = { version = "2", features = ["tray-icon"] }
+# dev-tools maps to Tauri's own `devtools` feature; gated off by default so the
+# WebView inspector is NEVER compiled into release builds (B222). The crate
+# `tauri-devtools` does not exist on crates.io — the canonical way is the
+# `tauri/devtools` feature flag (see [features] below).
+# Add `--features dev-tools` to `pnpm tauri dev` if you need the inspector.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ADR-0017 (2026-04-22): logger pipeline únic `tracing-subscriber` + `tracing-appender`
@@ -104,6 +109,10 @@ tempfile = "3"
 [features]
 default = []
 updater = ["tauri-plugin-updater"]
+# dev-tools: activates the Tauri WebView inspector via Tauri's own `devtools`
+# feature. Never set as default — only enable in debug builds via
+# `--features dev-tools` (B222), so it stays out of the release binary.
+dev-tools = ["tauri/devtools"]
 
 # Release hardening — binary hygiene (SLSA baseline)
 [profile.release]

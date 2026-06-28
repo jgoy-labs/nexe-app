@@ -189,13 +189,32 @@ const SIDECAR_BLOCKED_PATH_PREFIXES: &[&str] = &[
     "/v1/system/restart",
 ];
 
-/// Normalise a request path for blocklist matching:
-/// strip query string, strip fragment, trim trailing slash, lowercase.
+/// Normalise a request path for blocklist matching.
+///
+/// Strips the query string and fragment, then *canonicalises* the path so that
+/// router-equivalent spellings collapse to one form before the prefix check.
+/// The earlier version only trimmed the trailing slash, which left two bypass
+/// classes open: a double (or repeated) leading slash —
+/// `//admin/system/shutdown` — and dot-segments — `/admin/./system/shutdown`
+/// or `/admin/system/../system/shutdown`. Many ASGI/WSGI routers (Starlette,
+/// uvicorn, Werkzeug) normalise those back to the protected endpoint, so the
+/// guard must do the same. We rebuild the path from its segments: empty
+/// segments (from `//`) and `.` are dropped, `..` pops the parent (clamped at
+/// root), then everything is lower-cased for case-insensitive matching.
 fn normalize_path_for_blocklist(path: &str) -> String {
     let no_query = path.split('?').next().unwrap_or(path);
     let no_fragment = no_query.split('#').next().unwrap_or(no_query);
-    let trimmed = no_fragment.trim_end_matches('/');
-    trimmed.to_ascii_lowercase()
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in no_fragment.split('/') {
+        match segment {
+            "" | "." => continue, // collapse `//`, leading/trailing `/`, and `.`
+            ".." => {
+                segments.pop(); // parent-dir, clamped at root
+            }
+            other => segments.push(other),
+        }
+    }
+    format!("/{}", segments.join("/")).to_ascii_lowercase()
 }
 
 /// Path-level guard for `fetch_from_sidecar`.
@@ -716,6 +735,58 @@ mod tests {
                 validate_sidecar_path(path),
                 Ok(()),
                 "path {path:?} should be allowed"
+            );
+        }
+    }
+
+    /// Hardening: repeated leading slashes and dot-segments must not bypass the
+    /// blocklist. Routers normalise these back to the protected endpoint, so the
+    /// guard canonicalises the path before matching.
+    #[test]
+    fn validate_sidecar_path_blocks_slash_and_dot_bypasses() {
+        let bypasses = [
+            // Double / repeated leading slash.
+            "//admin/system/shutdown",
+            "///admin/system/shutdown",
+            "//api/v1/system/shutdown",
+            "//v1/system/restart",
+            // Internal repeated slash.
+            "/admin//system/shutdown",
+            "/api/v1//system/shutdown",
+            // Current-dir segments.
+            "/admin/./system/shutdown",
+            "/admin/system/./shutdown",
+            "/api/v1/system/./shutdown",
+            // Parent-dir segments that resolve back into the mount.
+            "/admin/system/../system/shutdown",
+            "/api/v1/foo/../system/shutdown",
+            // Mixed.
+            "//admin/./system//shutdown",
+            "/api/v1/system/../system/./shutdown/",
+        ];
+        for path in bypasses {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Err("BLOCKED_PATH"),
+                "path {path:?} should be blocked after canonicalisation"
+            );
+        }
+    }
+
+    /// The dot-segment canonicalisation must not over-block legitimate paths
+    /// that merely *resolve* to a non-system endpoint.
+    #[test]
+    fn validate_sidecar_path_dot_segments_do_not_overblock() {
+        let allowed = [
+            "/api/v1/knowledge/../knowledge/search",
+            "/api/v1/./chat/completions",
+            "//api/v1/memory/query",
+        ];
+        for path in allowed {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Ok(()),
+                "path {path:?} should be allowed after canonicalisation"
             );
         }
     }

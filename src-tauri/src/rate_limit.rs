@@ -45,7 +45,19 @@ pub(crate) fn rate_limit_ok_for(plugin_id: &str) -> bool {
     }
     let entry = match guard.get_mut(plugin_id) {
         Some(e) => e,
-        None => return true, // LRU evicted race — allow to avoid a cascading failure
+        None => {
+            // B165: unreachable. We hold the exclusive lock and just did put()
+            // (LRU cap >= 1; put() inserts as MRU and never evicts the entry it
+            // just inserted). Deliberate defensive fail-open: if the invariant
+            // ever broke we allow ONE request rather than panicking — a panic
+            // here would poison the global Mutex (we hold `guard`), making every
+            // later lock() fail → 429 permanent for ALL plugins. NOT a "race".
+            debug_assert!(
+                false,
+                "rate-limit entry vanished after put — LRU invariant broken"
+            );
+            return true;
+        }
     };
 
     // Refill tokens based on elapsed time

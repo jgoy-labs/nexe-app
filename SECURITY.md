@@ -2,9 +2,9 @@
 
 ## Reporting a Vulnerability
 
-This repository is a **starter template** for Tauri v2 desktop apps.
+This repository is **nexe-app**, the OSS desktop shell (Tauri v2) that packages server-nexe.
 
-- For vulnerabilities in **this template** (e.g., the `plugin://` resolver, CSP
+- For vulnerabilities in **this app** (e.g., the `plugin://` resolver, CSP
   baseline, CI workflow, resolve-path logic): open a private security advisory
   via the GitHub Security tab of the repo.
 - For vulnerabilities in **Tauri, Vite, or transitive dependencies**: report
@@ -17,9 +17,9 @@ This repository is a **starter template** for Tauri v2 desktop apps.
 
 ## Supported Versions
 
-This is a template, not a released product. Security fixes will be applied
-to the default branch; users are encouraged to keep their fork rebased on
-latest.
+nexe-app is a released product (current `1.0.6`). Security fixes are applied to
+the default branch and shipped in the next signed release; the latest release is
+the supported version.
 
 ## Security Baseline
 
@@ -34,7 +34,14 @@ mutation-verified — el test falla amb codi pre-fix i passa amb el codi post-fi
 Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
 
 **CSP + WebView:**
-- Strict CSP: `default-src 'self'`, no inline scripts, no inline styles (C11).
+- CSP baseline `default-src 'self'` (C11). The app bundle ships **no inline
+  scripts** (its single entry script is external, with SRI), but `script-src`
+  and `style-src` deliberately retain `'unsafe-inline'` (B236/B245):
+  `dangerousDisableAssetCspModification` is on so Tauri cannot inject nonces, the
+  splash + onboarding inject styles at runtime, and the sidecar-served loopback
+  web UI carries an inline bootstrap script. Dropping `'unsafe-inline'` is tracked
+  separately and needs a render-time gate first — a naive removal broke the
+  webview on 2026-06-15 and was reverted in 24 min. Guard: `src/csp.test.js`.
 - `'unsafe-eval'` removed from production `script-src` (I-002): it had been added
   for Vite HMR (commit 28750f2), but the `tauri.conf.json` `csp` applies only to
   production builds (dev loads from the Vite dev server). No frontend code, no
@@ -57,7 +64,8 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
   AI-assisted adversarial review detected that v0.1.1 claimed "removed" but
   had only cleared capabilities; the plugins were still initialised. Binary
   size ~-600KB est., IPC surface -2 plugin command sets. Remaining capabilities:
-  `core:default`, `dialog:default`, `deep-link:*` (specific subset) (C13 + B9).
+  `core:default`, `dialog:default` (C13 + B9). (`tauri-plugin-deep-link` removed
+  2026-05-18 — see `Cargo.toml`; the product no longer relies on OS deep links.)
 - `fetch_from_sidecar` URL validation parses structurally via `url::Url::parse`
   (Rust) + `new URL(...)` (JS) — rebutja userinfo hijack, hostname `localhost`,
   IPv6 mapped, wrong scheme, missing port (B2 — an AI-assisted
@@ -138,7 +146,7 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
 - `pnpm-workspace.yaml` ignoredOptionalDependencies `@rolldown/binding-*` — avoids
   500MB prerelease downloads per CI run (C20).
 - Rust toolchain pinned exact (`rust-toolchain.toml channel = "1.94.1"`) for
-  reproducibility L3 (ADR-0015, C59).
+  reproducibility L1-equivalent baseline (ADR-0015, C59); SLSA L3 deferred.
 - Cargo duplicate deps threshold enforced via `scripts/verify.sh` + documented
   in `docs/supply-chain/duplicate-deps.md` (C37).
 
@@ -156,6 +164,13 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
 - `concurrency.cancel-in-progress: true` prevents double-tag race (C32).
 - SBOM dual format CycloneDX + SPDX (C33).
 - Weekly bundle smoke test (full `tauri build` with bundle) (C45).
+- **Distribution channel (B053):** the shipped product is a locally-signed,
+  notarized DMG (`Developer ID Application`), built out-of-band — **not** by
+  this pipeline. The GitHub release workflow is a **verification gate** (quality
+  gate + SBOM + SHA256SUMS + `draft: true`), not the distribution channel: its
+  `tauri build` step does not bundle the Python sidecar (CI has no Python build
+  env, see `weekly-bundle-smoke.yml`) and emits unsigned, not-for-production
+  artifacts. Release assets are uploaded from the signed local DMG.
 
 **Starter hygiene:**
 - `rename.sh` enriched with author/email/repo/homepage prompts + logo placeholder
@@ -197,8 +212,8 @@ The Python sidecar (server-nexe) requires filesystem access and localhost networ
 - `canonicalize` + path traversal checks on all plugin:// requests
 - CSP + postMessage isolation pattern
 - Rate limiting (token bucket, burst-resistant)
-- Sidecar auth token (planned)
-- Process tree lifecycle management (planned)
+- Sidecar auth token (implemented — Bearer injected at the Rust boundary, per-session UUID; see "Auth + secrets" above)
+- Process tree lifecycle management (implemented — `src-tauri/src/lifecycle.rs`: Unix group-kill + Windows `taskkill /T`; atomic Windows Job Object still pending, K-002)
 
 This decision is subject to review before the v1 release (hardening).
 
@@ -217,9 +232,9 @@ This template has a substantial dependency tree:
 - Cargo.lock committed (reproducible builds)
 - `pnpm-lock.yaml` committed
 - `cargo build --locked` enforced in CI
+- Reproducible build hygiene with `SOURCE_DATE_EPOCH` + `--remap-path-prefix` (`./scripts/reproducible-build.sh`, ADR-0015)
 
 **Planned (roadmap):**
 - SBOM generation (`cargo cyclonedx`)
-- Reproducible builds with SOURCE_DATE_EPOCH (`./scripts/reproducible-build.sh`)
 - Ed25519 plugin signatures
 - SLSA provenance attestation

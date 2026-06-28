@@ -62,12 +62,46 @@ pub(crate) fn graceful_quit_try_acquire() -> bool {
     !DIALOG_SHOWING.swap(true, Ordering::AcqRel)
 }
 
+/// Latched once the user CONFIRMS a quit and the teardown sequence
+/// (POST shutdown + kill + exit) begins. Distinct from [`EXIT_CONFIRMED`],
+/// which is only set at the very end, right before `app.exit(0)`.
+///
+/// MC-033: `DIALOG_SHOWING` is released as soon as the confirm dialog returns
+/// (see `graceful_quit`), but `EXIT_CONFIRMED` is not set until the async
+/// teardown finishes. In that window a second trigger (Alt+F4, the window X,
+/// Cmd+Q, a second tray Quit) would re-enter `graceful_quit`, win the freed
+/// `DIALOG_SHOWING` guard, and stack a SECOND confirm dialog mid-shutdown.
+/// Latching this flag the instant the user confirms — before releasing
+/// `DIALOG_SHOWING` — closes that window. Never reset: once a quit is
+/// confirmed, no further dialog should ever appear.
+pub(crate) static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Decide whether `graceful_quit` should proceed to show a confirm dialog.
+/// Extracted as a pure helper so the MC-033 ordering can be unit tested.
+///
+/// Returns `true` only if no shutdown is already underway AND this caller wins
+/// the dialog guard. If a shutdown has started it returns `false` WITHOUT
+/// touching `DIALOG_SHOWING` (short-circuit), so a late trigger never opens a
+/// second dialog.
+///
+/// # Mutation testing
+///
+/// If the `SHUTDOWN_STARTED` check is removed, `t_shutdown_started_blocks_dialog`
+/// fails (a late trigger would acquire the guard and a second dialog would show).
+pub(crate) fn graceful_quit_should_start() -> bool {
+    if SHUTDOWN_STARTED.load(Ordering::Acquire) {
+        return false;
+    }
+    graceful_quit_try_acquire()
+}
+
 pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
     tracing::info!("graceful_quit invoked");
 
-    // Only one dialog at a time. If one is already open, return.
-    if !graceful_quit_try_acquire() {
-        tracing::debug!("graceful_quit invoked while dialog open — ignoring");
+    // MC-033: a confirmed teardown is already underway, or another dialog is
+    // open — either way, do not show a (second) dialog.
+    if !graceful_quit_should_start() {
+        tracing::debug!("graceful_quit invoked while shutting down or dialog open — ignoring");
         return;
     }
 
@@ -92,9 +126,16 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
             .buttons(MessageDialogButtons::OkCancel)
             .blocking_show();
 
+        // MC-033: if the user confirmed, latch SHUTDOWN_STARTED BEFORE releasing
+        // DIALOG_SHOWING. Any second trigger slipping in after the release then
+        // sees the shutdown is underway and bails out (no second dialog). On
+        // cancel we leave it false so a future quit still works.
+        if confirmed {
+            SHUTDOWN_STARTED.store(true, Ordering::Release);
+        }
+
         // Reset guard ALWAYS (happy path or cancel), to allow
-        // new triggers after the dialog. Release before deciding exit to
-        // minimize contention window.
+        // new triggers after the dialog (cancel case).
         DIALOG_SHOWING.store(false, Ordering::Release);
 
         if !confirmed {
@@ -126,30 +167,8 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
                 .map(|s| s.0.clone());
 
             if let (Some(port), Some(api_key), Some(client)) = (port_opt, api_key_opt, client_opt) {
-                let url = format!("http://127.0.0.1:{port}/admin/system/shutdown");
-                tracing::info!(%url, "POST sidecar shutdown (graceful)");
-                match client
-                    .post(&url)
-                    .header("X-API-Key", api_key)
-                    .timeout(Duration::from_millis(1500))
-                    .send()
-                    .await
-                {
-                    Ok(resp) => {
-                        tracing::info!(status = %resp.status(), "sidecar shutdown response")
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "sidecar shutdown POST failed (will SIGKILL)")
-                    }
-                }
-                // Give the sidecar the 0.3s scheduled SIGINT + lifespan teardown
-                // some headroom before kill_sidecar_child polls (it already
-                // waits up to 1.5s on its own, so 400ms here is enough).
-                tauri::async_runtime::spawn_blocking(|| {
-                    std::thread::sleep(Duration::from_millis(400));
-                })
-                .await
-                .ok();
+                // B168: extracted to a shared helper reused by restart_sidecar.
+                post_sidecar_shutdown(port, &api_key, &client).await;
             } else {
                 tracing::warn!("missing state for graceful POST (port/api_key/http) — skipping");
             }
@@ -162,6 +181,32 @@ pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
             app_for_shutdown.exit(0);
         });
     });
+}
+
+/// B168: POST /admin/system/shutdown to the sidecar (graceful), then give it
+/// ~400ms headroom before the caller SIGKILLs. Best-effort: logs and returns on
+/// any failure (the caller always follows up with `kill_sidecar_child`). Shared
+/// by `graceful_quit` (window close) and `restart_sidecar` (onboarding restart).
+pub(crate) async fn post_sidecar_shutdown(port: u16, api_key: &str, client: &reqwest::Client) {
+    let url = format!("http://127.0.0.1:{port}/admin/system/shutdown");
+    tracing::info!(%url, "POST sidecar shutdown (graceful)");
+    match client
+        .post(&url)
+        .header("X-API-Key", api_key)
+        .timeout(Duration::from_millis(1500))
+        .send()
+        .await
+    {
+        Ok(resp) => tracing::info!(status = %resp.status(), "sidecar shutdown response"),
+        Err(e) => tracing::warn!(error = %e, "sidecar shutdown POST failed (will SIGKILL)"),
+    }
+    // 0.3s scheduled SIGINT + lifespan teardown headroom before the kill poll
+    // (kill_sidecar_child itself also waits up to 1.5s).
+    tauri::async_runtime::spawn_blocking(|| {
+        std::thread::sleep(Duration::from_millis(400));
+    })
+    .await
+    .ok();
 }
 
 /// Helper extracted from `graceful_quit` for unit testability.
@@ -339,6 +384,45 @@ mod tests {
             1,
             "exactly one thread must win the dialog guard"
         );
+        DIALOG_SHOWING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn t_shutdown_started_blocks_dialog() {
+        // MC-033: once a shutdown is underway, a late trigger must NOT open a
+        // second dialog and must NOT acquire the dialog guard.
+        let _guard = dialog_test_lock();
+        DIALOG_SHOWING.store(false, Ordering::SeqCst);
+        SHUTDOWN_STARTED.store(true, Ordering::SeqCst);
+
+        assert!(
+            !graceful_quit_should_start(),
+            "a started shutdown must block any new dialog"
+        );
+        assert!(
+            !DIALOG_SHOWING.load(Ordering::SeqCst),
+            "blocked caller must not have acquired DIALOG_SHOWING"
+        );
+
+        // cleanup global state for other tests
+        SHUTDOWN_STARTED.store(false, Ordering::SeqCst);
+        DIALOG_SHOWING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn t_no_shutdown_allows_first_dialog() {
+        // MC-033: with no shutdown underway, the first caller proceeds and
+        // acquires the dialog guard.
+        let _guard = dialog_test_lock();
+        SHUTDOWN_STARTED.store(false, Ordering::SeqCst);
+        DIALOG_SHOWING.store(false, Ordering::SeqCst);
+
+        assert!(graceful_quit_should_start(), "first caller must proceed");
+        assert!(
+            DIALOG_SHOWING.load(Ordering::SeqCst),
+            "proceeding caller must hold DIALOG_SHOWING"
+        );
+
         DIALOG_SHOWING.store(false, Ordering::SeqCst);
     }
 

@@ -5,6 +5,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# B143: version-sync (same 3 internal sources as the CI gate). Called from
+# the repo root, before the `cd src-tauri` further below. --skip-server-nexe because
+# a local verify.sh does not guarantee a sibling server-nexe at an aligned version.
+echo "=== version sync (3 fonts internes nexe-app) ==="
+bash scripts/check-version-sync.sh --skip-server-nexe
+
 echo "=== pnpm install ==="
 pnpm install --frozen-lockfile
 

@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # check-version-sync.sh — CI-H02
-# Verifica que les fonts de versió del projecte declaren el mateix valor.
+# Verifies that the project's version sources declare the same value.
 #
-# Fonts comprovades:
+# Sources checked:
 #   1. nexe-app/package.json              ("version")
 #   2. nexe-app/src-tauri/Cargo.toml      ([package] version)
 #   3. nexe-app/src-tauri/tauri.conf.json ("version")
-#   4. server-nexe/pyproject.toml         (version = "…")  — si accessible
+#   4. server-nexe/pyproject.toml         (version = "…")  — if accessible
 #
-# Ús:
-#   bash scripts/check-version-sync.sh                          # intenta localitzar server-nexe automàticament
-#   bash scripts/check-version-sync.sh /ruta/al/server-nexe    # path explícit al repo germà
-#   bash scripts/check-version-sync.sh --skip-server-nexe      # omet la font 4 (CI de nexe-app sense checkout de server-nexe)
+# Usage:
+#   bash scripts/check-version-sync.sh                          # tries to locate server-nexe automatically
+#   bash scripts/check-version-sync.sh /path/to/server-nexe    # explicit path to the sibling repo
+#   bash scripts/check-version-sync.sh --skip-server-nexe      # skips source 4 (nexe-app CI without a server-nexe checkout)
 #
-# Retorna exit 0 si totes les fonts comprovades coincideixen,
-#          exit 1 amb diagnòstic detallat si divergeixen.
+# Returns exit 0 if all checked sources match,
+#          exit 1 with detailed diagnostics if they diverge.
 #
-# Compatible amb bash 3.x (macOS) i bash 4+/5 (Linux/CI).
+# Compatible with bash 3.x (macOS) and bash 4+/5 (Linux/CI).
 
 set -euo pipefail
 
@@ -36,8 +36,8 @@ for arg in "$@"; do
     esac
 done
 
-# ---- Resolució de paths ----
-# L'script pot executar-se des de l'arrel de nexe-app o des de scripts/
+# ---- Path resolution ----
+# The script can run from the nexe-app root or from scripts/
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -48,38 +48,38 @@ TAURI_CONF="$REPO_ROOT/src-tauri/tauri.conf.json"
 
 if [[ "$SKIP_SERVER_NEXE" == false ]]; then
     if [[ -n "$SERVER_NEXE_ARG" ]]; then
-        # Path explícit (absolut o relatiu al cwd del runner, no al REPO_ROOT)
+        # Explicit path (absolute or relative to the runner's cwd, not REPO_ROOT)
         SERVER_NEXE_ROOT="$(cd "$SERVER_NEXE_ARG" 2>/dev/null && pwd)" || {
             echo "ERROR: no s'ha pogut accedir a server-nexe a '$SERVER_NEXE_ARG'"
             exit 1
         }
     else
-        # Convenció de monorepo local: server-nexe al costat de nexe-app
+        # Local monorepo convention: server-nexe next to nexe-app
         SERVER_NEXE_ROOT="$(cd "$REPO_ROOT/.." && pwd)/server-nexe"
     fi
     PYPROJECT="$SERVER_NEXE_ROOT/pyproject.toml"
 fi
 
-# ---- Funcions d'extracció ----
+# ---- Extraction functions ----
 
 extract_package_json() {
-    # Llegim per stdin (no per ruta): a Windows el bash MSYS obre la ruta /d/a/...
-    # però el python3 natiu no entén rutes MSYS. stdin evita passar-li cap ruta.
+    # We read from stdin (not from a path): on Windows MSYS bash opens the /d/a/... path
+    # but native python3 does not understand MSYS paths. stdin avoids passing it any path.
     python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" < "$PACKAGE_JSON"
 }
 
 extract_cargo_toml() {
-    # Llegeix la primera línia 'version = "…"' de la secció [package].
-    # Nota: /^\[package\]/,/^\[/ no funciona en awk BSD/macOS perquè el pattern
-    # de fi /^\[/ coincideix amb la mateixa línia d'inici, col·lapsant el rang.
-    # Usem un acumulador manual per evitar-ho.
+    # Reads the first 'version = "…"' line of the [package] section.
+    # Note: /^\[package\]/,/^\[/ does not work in BSD/macOS awk because the end
+    # pattern /^\[/ matches the same start line, collapsing the range.
+    # We use a manual accumulator to avoid that.
     awk '/^\[package\]/{found=1} found && /^\[/ && !/^\[package\]/{exit} found{print}' "$CARGO_TOML" \
         | grep -m1 '^version' \
         | sed 's/version = "\(.*\)"/\1/'
 }
 
 extract_tauri_conf() {
-    # Vegeu extract_package_json: stdin per compatibilitat amb Windows (bash MSYS + python natiu).
+    # See extract_package_json: stdin for Windows compatibility (MSYS bash + native python).
     python3 -c "import json,sys; print(json.load(sys.stdin)['version'])" < "$TAURI_CONF"
 }
 
@@ -88,7 +88,7 @@ extract_pyproject() {
     grep -m1 '^version' "$PYPROJECT" | sed 's/version = "\(.*\)"/\1/'
 }
 
-# ---- Recull de versions (variables simples per compatibilitat bash 3) ----
+# ---- Version collection (simple variables for bash 3 compatibility) ----
 
 V_PACKAGE_JSON="$(extract_package_json)"
 V_CARGO_TOML="$(extract_cargo_toml)"
@@ -106,7 +106,7 @@ else
     echo "      Passa el path com a argument o usa --skip-server-nexe per ometre'l."
 fi
 
-# ---- Comparació ----
+# ---- Comparison ----
 
 echo ""
 echo "=== Versions detectades ==="
@@ -118,7 +118,7 @@ if [[ "$CHECK_PYPROJECT" == true ]]; then
 fi
 echo ""
 
-# Construeix llista de valors a comparar
+# Builds a list of values to compare
 ALL_VERSIONS="$V_PACKAGE_JSON
 $V_CARGO_TOML
 $V_TAURI_CONF"
