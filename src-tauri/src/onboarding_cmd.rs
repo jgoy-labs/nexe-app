@@ -6,6 +6,7 @@
 //! Detection is file-based (not localStorage) so it survives browser storage clears
 //! and is consistent across WebView restarts.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Manager};
 
 /// Return `true` when the onboarding wizard has not yet been completed.
@@ -22,17 +23,35 @@ pub fn check_first_run(app: AppHandle) -> bool {
     !flag.exists()
 }
 
-/// Return `true` when a previous partial installation is detected:
-/// the sidecar bundle was extracted (`.extracted` marker exists) but
-/// the wizard was never completed (`onboarding_complete` absent).
+/// Partial-install state snapshotted at boot, BEFORE `setup_services` extracts
+/// the sidecar bundle (which writes `.extracted` for THIS very session).
 ///
-/// Called via `invoke("check_partial_install")` from Step 1 to decide
-/// whether to show the "Reset installation…" banner.
-#[tauri::command]
-pub fn check_partial_install(app: AppHandle) -> bool {
+/// TOCTOU guard: a live check at Step 1 would read our own fresh `.extracted`
+/// marker as if it came from a previous, aborted session — so every virgin
+/// install showed the "Reset installation…" banner. Managed as first thing in
+/// `setup_services` (lib.rs), read by `check_partial_install`.
+pub struct PartialInstallAtBoot(pub AtomicBool);
+
+/// Pure detection (called ONCE at boot, before extraction): the sidecar bundle
+/// was extracted (`.extracted` exists) but the wizard was never completed
+/// (`onboarding_complete` absent) — i.e. a genuinely aborted previous session.
+pub fn detect_partial_install(app: &AppHandle) -> bool {
     let data_dir = app.path().app_data_dir().unwrap_or_default();
     let extracted = data_dir.join("sidecar").join(".extracted");
-    extracted.exists() && !flag_path(&app).exists()
+    extracted.exists() && !flag_path(app).exists()
+}
+
+/// Return the boot-time snapshot of the partial-install state.
+///
+/// Called via `invoke("check_partial_install")` from Step 1 to decide
+/// whether to show the "Reset installation…" banner. Fail-safe: if the
+/// snapshot was never taken, report `false` so a virgin user never sees
+/// a spurious reset banner.
+#[tauri::command]
+pub fn check_partial_install(app: AppHandle) -> bool {
+    app.try_state::<PartialInstallAtBoot>()
+        .map(|s| s.0.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// Clear all installation state so the next launch re-extracts the
@@ -40,7 +59,8 @@ pub fn check_partial_install(app: AppHandle) -> bool {
 ///
 /// Removes:
 ///   - `<app_config_dir>/onboarding_complete`
-///   - `<app_data_dir>/sidecar/data/onboarding_state.json`
+///   - `<app_data_dir>/sidecar/data/onboarding.json` (sidecar state — the
+///     name the sidecar actually writes, see server-nexe core/onboarding_state.py)
 ///   - `<app_data_dir>/sidecar/.extracted`
 ///
 /// Called via `invoke("reset_installation")` when the user confirms
@@ -52,6 +72,12 @@ pub fn reset_installation(app: AppHandle) {
     // Errors are silently ignored — worst case the wizard shows again, which
     // is a safe degradation for a non-destructive reset.
     let _ = reset_installation_inner(&app, false);
+    // The reset just removed `.extracted`, so the boot snapshot is stale by
+    // design: clear it so the banner does not reappear after the frontend's
+    // `location.reload()`.
+    if let Some(snapshot) = app.try_state::<PartialInstallAtBoot>() {
+        snapshot.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Outcome of an uninstall/reset sweep.
@@ -119,12 +145,16 @@ fn reset_paths(
 ) -> UninstallReport {
     let mut report = UninstallReport::default();
     remove_file_tracked(&mut report, &config_dir.join("onboarding_complete"));
+    // NB: the sidecar persists its state as `onboarding.json` under
+    // NEXE_DATA_DIR (= <app_data_dir>/sidecar/data). The old name
+    // `onboarding_state.json` never existed on disk — the reset was
+    // silently skipping the sidecar state.
     remove_file_tracked(
         &mut report,
         &data_dir
             .join("sidecar")
             .join("data")
-            .join("onboarding_state.json"),
+            .join("onboarding.json"),
     );
     remove_file_tracked(&mut report, &data_dir.join("sidecar").join(".extracted"));
 
@@ -173,6 +203,12 @@ pub fn mark_onboarding_complete(app: AppHandle) {
     if let Ok(config_dir) = app.path().app_config_dir() {
         let _ = std::fs::create_dir_all(&config_dir);
         let _ = std::fs::write(config_dir.join("onboarding_complete"), b"1");
+    }
+    // Keep the boot snapshot coherent: once the wizard is complete there is no
+    // partial install by definition (matters only if a future flow re-renders
+    // Step 1 in the same session, but cheap to keep semantically exact).
+    if let Some(snapshot) = app.try_state::<PartialInstallAtBoot>() {
+        snapshot.0.store(false, Ordering::Relaxed);
     }
 }
 
@@ -265,14 +301,8 @@ mod tests {
     // ── reset_installation helpers ─────────────────────────────────────────
 
     fn do_reset(config_dir: &std::path::Path, data_dir: &std::path::Path) {
-        let _ = fs::remove_file(config_dir.join("onboarding_complete"));
-        let _ = fs::remove_file(
-            data_dir
-                .join("sidecar")
-                .join("data")
-                .join("onboarding_state.json"),
-        );
-        let _ = fs::remove_file(data_dir.join("sidecar").join(".extracted"));
+        let report = super::reset_paths(config_dir, data_dir, false);
+        assert!(report.all_ok(), "reset failures: {:?}", report.failures);
     }
 
     #[test]
@@ -284,13 +314,15 @@ mod tests {
         write_extracted(data.path());
         let state_path = data.path().join("sidecar").join("data");
         fs::create_dir_all(&state_path).unwrap();
-        fs::write(state_path.join("onboarding_state.json"), b"{}").unwrap();
+        // The sidecar's real state file name (server-nexe core/onboarding_state.py):
+        // guards against regressing to the phantom `onboarding_state.json`.
+        fs::write(state_path.join("onboarding.json"), b"{}").unwrap();
 
         do_reset(cfg.path(), data.path());
 
         assert!(!cfg.path().join("onboarding_complete").exists());
         assert!(!data.path().join("sidecar").join(".extracted").exists());
-        assert!(!state_path.join("onboarding_state.json").exists());
+        assert!(!state_path.join("onboarding.json").exists());
     }
 
     #[test]

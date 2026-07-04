@@ -12,7 +12,7 @@ A clean starter for **Tauri v2 desktop apps**, with optional Python sidecar wiri
 - [Prerequisites](#prerequisites)
 - [Adding a Python sidecar](#adding-a-python-sidecar)
 - [Switching to React / Svelte / Vue](#switching-to-react--svelte--vue)
-- [Adding auth baseline](#adding-auth-baseline)
+- [Auth baseline](#auth-baseline-s10--active-in-the-starter)
 - [What this template already solves](#what-this-template-already-solves)
 - [What's still TODO](#whats-still-todo)
 

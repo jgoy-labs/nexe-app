@@ -365,6 +365,12 @@ packages:
     os: [linux]
     libc: [glibc]
 
+  '@rolldown/binding-win32-arm64-msvc@1.0.3':
+    resolution: {integrity: sha512-gEdFFEN70A/jxb2svrWsN3aDL7OUtmvlOy+6fa2jxG8K0wQ1ZbdeLGnidov6Yu5/733dI5ySfzFlQ/cb0bSz1g==}
+    engines: {node: ^20.19.0 || >=22.12.0}
+    cpu: [arm64]
+    os: [win32]
+
   '@rolldown/binding-win32-x64-msvc@1.0.3':
     resolution: {integrity: sha512-eXB7CHuaQdqmJcc3koCNtNPmT/bj2gc999kUFgBxG8Ac0NdgXc4rkCHhqrgrhN3zddvvvrgzj1e90SuSfmyIXA==}
     engines: {node: ^20.19.0 || >=22.12.0}
@@ -1349,7 +1355,6 @@ ignoredOptionalDependencies:
   - '@rolldown/binding-linux-x64-musl'
   - '@rolldown/binding-openharmony-arm64'
   - '@rolldown/binding-wasm32-wasi'
-  - '@rolldown/binding-win32-arm64-msvc'
   - '@rolldown/binding-win32-ia32-msvc'
 
 snapshots:
@@ -1561,6 +1566,9 @@ snapshots:
     optional: true
 
   '@rolldown/binding-linux-x64-gnu@1.0.3':
+    optional: true
+
+  '@rolldown/binding-win32-arm64-msvc@1.0.3':
     optional: true
 
   '@rolldown/binding-win32-x64-msvc@1.0.3':
@@ -2221,6 +2229,7 @@ snapshots:
       '@rolldown/binding-darwin-arm64': 1.0.3
       '@rolldown/binding-linux-arm64-gnu': 1.0.3
       '@rolldown/binding-linux-x64-gnu': 1.0.3
+      '@rolldown/binding-win32-arm64-msvc': 1.0.3
       '@rolldown/binding-win32-x64-msvc': 1.0.3
 
   run-parallel@1.2.0:

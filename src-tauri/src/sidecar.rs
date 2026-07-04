@@ -224,6 +224,13 @@ pub(crate) fn resolve_sidecar_path_dev(manifest_dir: &std::path::Path) -> Result
 /// The launcher finds venv/app via `NEXE_SIDECAR_DIR` (set by Rust spawner in release mode).
 pub(crate) fn resolve_sidecar_path_prod(exe_path: &std::path::Path) -> Result<PathBuf, String> {
     let dir = exe_path.parent().ok_or("exe has no parent")?;
+    // On Windows the externalBin keeps its .exe suffix (Tauri strips the host triple
+    // but not the extension). This stub is INERT — the runtime spawns
+    // venv\Scripts\python.exe from the extracted data-dir (build_windows_sidecar_command);
+    // this path only needs to exist to satisfy the gate below.
+    #[cfg(windows)]
+    let path = dir.join("nexe-sidecar.exe");
+    #[cfg(not(windows))]
     let path = dir.join("nexe-sidecar");
     if !path.is_file() {
         return Err(format!(
@@ -299,6 +306,9 @@ mod tests {
         fs::create_dir_all(&macos_dir).unwrap();
         let exe = macos_dir.join("nexe-app");
         fs::write(&exe, b"binary").unwrap();
+        #[cfg(windows)]
+        let launcher = macos_dir.join("nexe-sidecar.exe");
+        #[cfg(not(windows))]
         let launcher = macos_dir.join("nexe-sidecar");
         fs::write(&launcher, "#!/bin/bash\nexit 0\n").unwrap();
 
@@ -322,10 +332,18 @@ mod tests {
         );
     }
 
-    // Test kill_sidecar_child with real subprocess (sleep 60s)
+    // Test kill_sidecar_child with real subprocess (~60s sleeper)
 
     #[test]
     fn kill_sidecar_child_kills_running_process() {
+        // Windows has no `sleep`; ping -n 60 is the stdin-free equivalent
+        // (timeout.exe refuses redirected input, e.g. under SSH/CI).
+        #[cfg(windows)]
+        let child = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 60 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn ping sleeper should succeed on Windows");
+        #[cfg(not(windows))]
         let child = std::process::Command::new("sleep")
             .arg("60")
             .spawn()

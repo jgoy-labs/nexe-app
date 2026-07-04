@@ -1,9 +1,21 @@
-# ADR-0013: Isolation Pattern — ACTIVE
+# ADR-0013: Isolation Pattern
 
 **Date:** 2026-04-18
-**Status:** Accepted — **Active**
+**Status:** **Superseded 2026-05-18** — pattern disabled (brownfield); see Amendment below
 **Decided by:** Jordi Goy
 **Previous status:** deferred to plugin marketplace phase
+
+> **Amendment 2026-05-18 (commit `a6d9031`):** the Isolation Pattern was **disabled**
+> (`"pattern": { "use": "brownfield" }`, `isolation` Cargo feature removed). Reason:
+> Tauri v2 serves the isolation iframe from a custom `isolation-{uuid}://` scheme, and
+> with `dangerousDisableAssetCspModification` the CSP must list that origin manually —
+> but CSP source syntax cannot express an unknown custom scheme, so WebKit dropped the
+> rule and the iframe load was refused, blocking app boot. At runtime today no IPC call
+> flows through the isolation hook (it only ever validated the `greet` demo command).
+> The `isolation-frame/` allowlist + drift-detection CI test (C02) are kept for a future
+> re-enable. **Proper fix (to revisit):** drop `dangerousDisableAssetCspModification` and
+> let Tauri auto-inject the isolation origin into the CSP, or use a CSP scheme-source the
+> browser honours. The section below documents the *intended* design, not the current runtime.
 
 ## Context
 

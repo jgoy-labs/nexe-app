@@ -17,7 +17,7 @@ This repository is **nexe-app**, the OSS desktop shell (Tauri v2) that packages 
 
 ## Supported Versions
 
-nexe-app is a released product (current `1.0.6`). Security fixes are applied to
+nexe-app is a released product (current `1.0.7`). Security fixes are applied to
 the default branch and shipped in the next signed release; the latest release is
 the supported version.
 
@@ -55,16 +55,24 @@ Un test que passa amb ambdós és teatre i s'ha eliminat o reescrit.
 - `freezePrototype: true` — blocks prototype pollution XSS (C22).
 
 **IPC + Isolation:**
-- Isolation Pattern active with explicit allowlist including drift detection CI
-  test — if any new `#[tauri::command]` is registered without updating
-  `isolation-frame/isolation.js`, CI fails (C02).
+- Isolation Pattern **currently disabled** (`"pattern": { "use": "brownfield" }`
+  in `tauri.conf.json`, since 2026-05-18 — see ADR-0013). The Tauri isolation
+  iframe loads from a custom `isolation-{uuid}://` scheme that CSP source syntax
+  cannot allowlist, which blocked app boot; dropping the pattern was the
+  workaround (the `isolation` Cargo feature is also off). The
+  `isolation-frame/isolation.js` allowlist and its drift-detection CI test (C02)
+  are **kept in place** so the pattern can be re-enabled once the CSP issue is
+  solved, but **at runtime today no IPC call flows through the isolation hook**.
+  Re-enabling is tracked (proper fix: drop `dangerousDisableAssetCspModification`
+  and let Tauri auto-inject the isolation origin into the CSP).
 - `tauri-plugin-store` + `tauri-plugin-notification` **removed entirely**
   (B9 — not just capability filter): plugin `.init()` calls removed
   from `run()` + `[dependencies]` entries removed from `Cargo.toml`. An
   AI-assisted adversarial review detected that v0.1.1 claimed "removed" but
   had only cleared capabilities; the plugins were still initialised. Binary
   size ~-600KB est., IPC surface -2 plugin command sets. Remaining capabilities:
-  `core:default`, `dialog:default` (C13 + B9). (`tauri-plugin-deep-link` removed
+  `core:default`, `dialog:allow-message`, `dialog:allow-open` (C13 + B9 + B12 —
+  `dialog:default` narrowed to the two commands actually used). (`tauri-plugin-deep-link` removed
   2026-05-18 — see `Cargo.toml`; the product no longer relies on OS deep links.)
 - `fetch_from_sidecar` URL validation parses structurally via `url::Url::parse`
   (Rust) + `new URL(...)` (JS) — rebutja userinfo hijack, hostname `localhost`,
@@ -210,10 +218,10 @@ The Python sidecar (server-nexe) requires filesystem access and localhost networ
 
 **Mitigations in place:**
 - `canonicalize` + path traversal checks on all plugin:// requests
-- CSP + postMessage isolation pattern
+- CSP (`default-src 'self'`) + `withGlobalTauri: false` (no global `window.__TAURI__` bridge). Note: the Tauri isolation pattern is currently disabled (brownfield — see "IPC + Isolation" above); re-enabling it is tracked.
 - Rate limiting (token bucket, burst-resistant)
 - Sidecar auth token (implemented — Bearer injected at the Rust boundary, per-session UUID; see "Auth + secrets" above)
-- Process tree lifecycle management (implemented — `src-tauri/src/lifecycle.rs`: Unix group-kill + Windows `taskkill /T`; atomic Windows Job Object still pending, K-002)
+- Process tree lifecycle management (implemented — `src-tauri/src/lifecycle.rs`: Unix group-kill + Windows `taskkill /T`; Windows Job Object `KILL_ON_JOB_CLOSE` implemented in `src-tauri/src/win_job.rs`, sidecar assigned to the job at spawn — K-002, shipped v1.0.7)
 
 This decision is subject to review before the v1 release (hardening).
 

@@ -2,7 +2,7 @@
 
 **App Desktop OSS per server-nexe.**
 
-Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i la UI web existent. Afegeix sistema visual de plugins i distribució DMG/AppImage.
+Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i la UI web existent. Afegeix sistema visual de plugins i distribució DMG (macOS) · AppImage (Linux) · installer NSIS (Windows ARM64).
 
 ## Principis
 
@@ -22,16 +22,17 @@ Shell Tauri v2 que empaqueta server-nexe (sidecar Python amb venv relocatable) i
 | Empaquetament | venv relocatable via `build-sidecar.sh` |
 | Vector DB | Qdrant |
 | LLM | Ollama |
-| Packaging | DMG signat/notaritzat · AppImage |
+| Packaging | DMG signat/notaritzat (macOS) · AppImage (Linux) · installer NSIS (Windows ARM64, sense signar) |
 
 ## Plataformes
 
-- macOS Apple Silicon (principal)
-- Linux x86_64 (CI + UTM/OrbStack per dev)
+- macOS Apple Silicon (principal) — DMG
+- Linux x86_64 i ARM64 — AppImage
+- Windows 11 ARM64 (des de v1.0.7) — installer NSIS (sense signar; SmartScreen avisa). Backend d'inferència: Ollama.
 
 ## Estat
 
-**v1.0.6** — Fases 1-6 completes: shell Tauri + UI empaquetada, onboarding, catàleg de models, token Hugging Face i distribució DMG/AppImage.
+**v1.0.7** — Fases 1-6 completes: shell Tauri + UI empaquetada, onboarding, catàleg de models, token Hugging Face i distribució DMG (macOS) / AppImage (Linux) / installer NSIS Windows ARM64.
 
 ## Prerequisits (macOS + Linux)
 

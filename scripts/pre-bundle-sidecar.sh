@@ -28,6 +28,13 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SIDECAR_SRC="$ROOT/target/sidecar"
 TARBALL="$ROOT/src-tauri/sidecar-bundle.tar.gz"
 
+# Platform family (Windows runs under Git-for-Windows / MSYS2).
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) OS_KIND=windows ;;
+    Darwin)               OS_KIND=macos ;;
+    *)                    OS_KIND=linux ;;
+esac
+
 if [ ! -d "$SIDECAR_SRC/venv" ]; then
   echo "pre-bundle-sidecar: target/sidecar/venv/ not found — run scripts/build-sidecar.sh first"
   exit 1
@@ -66,7 +73,11 @@ find "$SIDECAR_SRC" -name '._*' -delete 2>/dev/null || true
 # syntax). We detect the real tar and branch:
 #   - GNU tar (Linux): omit BSD flags; the prior `find -delete` already cleans AppleDouble.
 #   - BSD tar (macOS): keep the original behaviour + historical fallback.
-if tar --version 2>&1 | grep -q "GNU tar"; then
+if [ "$OS_KIND" = windows ]; then
+    # Git-for-Windows tar (bsdtar or GNU). The Windows bundle is symlink-free; use a
+    # plain gzip archive with no macOS/BSD-only flags and no Unix ownership (NTFS has none).
+    tar -czf "$TARBALL" -C "$SIDECAR_SRC" venv app python-runtime
+elif tar --version 2>&1 | grep -q "GNU tar"; then
     # Linux / GNU tar — no BSD flags. --owner=0 --group=0 normalizes UID/GID
     # (functional equivalent of --no-same-owner, but applied at creation).
     tar --owner=0 --group=0 -czf "$TARBALL" \

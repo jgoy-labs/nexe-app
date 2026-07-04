@@ -11,7 +11,7 @@
 
 import { readFileSync, writeFileSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { resolve, join } from "node:path";
+import { resolve, join, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -62,7 +62,9 @@ for (const assetPath of assets) {
   const sri = `integrity="sha384-${hash}" crossorigin="anonymous"`;
 
   // Relative URL as it appears in index.html: /assets/filename.js
-  const relPath = "/assets/" + assetPath.split("/assets/").pop();
+  // basename() is separator-agnostic: on Windows path.join yields backslashes, so
+  // split("/assets/") would fail and corrupt relPath — dropping SRI silently (B-win).
+  const relPath = "/assets/" + basename(assetPath);
 
   // Escape special regex chars in the path
   const escapedPath = relPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -90,8 +92,19 @@ for (const assetPath of assets) {
 
 writeFileSync(distHtml, html);
 
+// Fail loud: assets exist but the emitted HTML carries no SRI at all → the injection
+// silently no-op'd (e.g. path-separator mismatch on Windows). Better to fail the build
+// than ship an installer whose frontend lost its integrity attributes. Outcome-based
+// (checks the HTML) so an idempotent re-run over already-tagged HTML still passes.
+if (assets.length > 0 && !/integrity="sha384-/.test(html)) {
+  console.error(
+    "[sri] ERROR: assets present but dist/index.html has no integrity= — SRI not applied. Failing build."
+  );
+  process.exit(1);
+}
+
 if (modified > 0) {
   console.info(`[sri] SRI added to ${modified} asset(s) in dist/index.html`);
 } else {
-  console.info("[sri] no tags updated (assets may already have integrity or use different paths)");
+  console.info("[sri] no tags updated (assets already have integrity)");
 }

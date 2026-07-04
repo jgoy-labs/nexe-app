@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "targets": ["nsis"],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English", "Catalan", "Spanish"],
+        "customLanguageFiles": {
+          "Catalan": "./nsis/Catalan.nsh"
+        },
+        "installerIcon": "icons/icon.ico"
+      }
+    }
+  }
+}

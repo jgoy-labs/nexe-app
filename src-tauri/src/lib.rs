@@ -24,6 +24,8 @@ pub mod rate_limit;
 pub mod sidecar;
 pub mod sidecar_extract;
 pub mod validate;
+#[cfg(windows)]
+pub mod win_job;
 
 // Re-export command functions under their short names so
 // generate_handler! registers them as "get_hardware" etc. (matching
@@ -120,11 +122,273 @@ fn get_sidecar_port(port_state: tauri::State<'_, SidecarPort>) -> u16 {
     port_state.get()
 }
 
+/// B3 (Windows port, option c — validated externally 2026-06-11): build the
+/// sidecar Command without the bash launcher. Windows has no bash, and no
+/// exec(2) to make a wrapper transparent — an intermediate cmd/bat parent
+/// would break the NEXE_TRAY_PID watchdog and sit outside the Job Object
+/// story. So the Rust spawner replicates `nexe-sidecar` inline:
+///   - python-runtime\python.exe (bundled PBS) spawned directly with the uvicorn argv
+///   - PYTHONNOUSERSITE/PYTHONDONTWRITEBYTECODE here (PYTHONUNBUFFERED is set
+///     by the shared spawn code), PYTHONHOME always the bundled python-runtime
+///     (the boot interpreter lives inside it, so it always exists)
+///   - fastembed cache seeded at first launch (launcher Step 5.9 equivalent)
+///   - auth token via child env NEXE_TOKEN_INTERNAL: equivalent threat model
+///     to the POSIX stdin→export (reading another same-user process env needs
+///     PROCESS_VM_READ, just like /proc/<pid>/environ)
+///   - CREATE_NO_WINDOW so no console flashes in GUI mode
+///
+/// `sidecar_dir` resolution mirrors the launcher: NEXE_SIDECAR_DIR equivalent
+/// (the extraction dir, prod) or the launcher's own directory (dev bench).
+#[cfg(windows)]
+fn build_windows_sidecar_command(
+    sidecar_path: &Path,
+    sidecar_data_dir: Option<&std::path::Path>,
+    auth_token: &str,
+    port: u16,
+) -> Result<Command, String> {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let sidecar_dir = match sidecar_data_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => sidecar_path
+            .parent()
+            .ok_or("sidecar path has no parent")?
+            .to_path_buf(),
+    };
+    // Spawn the bundled PBS python.exe DIRECTLY (not venv\Scripts\python.exe). The venv
+    // launcher is a redirector that resolves pyvenv.cfg `home` relative to itself and does
+    // NOT support a relocatable relative home on Windows (fails "No Python at ..." once the
+    // bundle moves out of the build dir). The PBS runs standalone; the venv's installed
+    // packages are exposed to it via a relative .pth that build-sidecar.sh writes into the
+    // PBS site-packages (Step 5.5b). Empirically validated on Win11 ARM64 (2026-07-01).
+    let python = sidecar_dir.join("python-runtime").join("python.exe");
+    if !python.is_file() {
+        return Err(format!(
+            "sidecar python does not exist: {} — build the Windows sidecar bundle",
+            python.display()
+        ));
+    }
+    let app_dir = sidecar_dir.join("app");
+
+    seed_fastembed_cache(&sidecar_dir);
+
+    let mut cmd = Command::new(python);
+    cmd.args([
+        "-m",
+        "uvicorn",
+        "core.app:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--workers",
+        "1",
+        "--lifespan",
+        "on",
+        "--no-access-log",
+        "--app-dir",
+        &app_dir.to_string_lossy(),
+    ]);
+    cmd.env("PYTHONNOUSERSITE", "1")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("NEXE_TOKEN_INTERNAL", auth_token);
+    // The boot interpreter lives inside python-runtime/ (verified above via `python`),
+    // so PYTHONHOME is always the bundled runtime — no conditional needed under the
+    // direct-PBS boot. (The old `is_dir()` guard was dead code from the venv-boot era.)
+    cmd.env("PYTHONHOME", sidecar_dir.join("python-runtime"));
+    // Windows stdio inherits the system ANSI code page (cp1252 on Latin locales);
+    // any Unicode print() from the sidecar would raise UnicodeEncodeError and abort
+    // the process. PYTHONUTF8=1 forces Python's UTF-8 mode: stdout/stderr AND default
+    // file I/O become UTF-8 with the forgiving surrogateescape error handler (so even a
+    // lone surrogate from os.fsdecode() round-trips instead of crashing). We deliberately
+    // do NOT also set PYTHONIOENCODING=utf-8: that forces the 'strict' handler and would
+    // reintroduce the exact crash class. macOS/Linux are already UTF-8 and this fn is
+    // #[cfg(windows)], so the fix is scoped to the platform that needs it.
+    cmd.env("PYTHONUTF8", "1");
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    Ok(cmd)
+}
+
+/// Launcher Step 5.9 equivalent (Windows): seed the fastembed model cache to
+/// the user cache dir at first launch. The bundle ships it read-only inside
+/// the app; fastembed writes files_metadata.json on first load, so it must
+/// live somewhere writable. Best-effort: a failed seed only means a download
+/// at first chat.
+#[cfg(windows)]
+fn seed_fastembed_cache(sidecar_dir: &Path) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let src = sidecar_dir.join("app").join(".fastembed_cache");
+    let dst_root = home.join(".cache").join("fastembed");
+    let marker =
+        dst_root.join("models--sentence-transformers--paraphrase-multilingual-mpnet-base-v2");
+    if !src.is_dir() || marker.exists() {
+        return;
+    }
+    match copy_dir_recursive(&src, &dst_root) {
+        Ok(()) => tracing::info!("first launch: fastembed cache seeded to user cache"),
+        Err(e) => {
+            tracing::warn!(error = %e, "fastembed cache seed failed (will download at first chat)")
+        }
+    }
+}
+
+/// Minimal recursive copy (no symlink handling — the fastembed cache is plain
+/// files; the Windows bundle never ships symlinks, unlike the macOS venv).
+#[cfg(windows)]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod win_spawn_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    fn make_sidecar_dir() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Windows bundle: the PBS at python-runtime\python.exe is the boot interpreter
+        // (spawned directly; the venv launcher can't resolve a relocatable relative home).
+        let runtime = tmp.path().join("python-runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::write(runtime.join("python.exe"), b"stub").unwrap();
+        // The venv still ships (deps reached via a relative .pth) but is not the boot exe.
+        std::fs::create_dir_all(tmp.path().join("venv").join("Lib").join("site-packages")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("app")).unwrap();
+        tmp
+    }
+
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == OsStr::new(key))
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn missing_python_yields_actionable_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = build_windows_sidecar_command(
+            &tmp.path().join("nexe-sidecar"),
+            Some(tmp.path()),
+            "tok",
+            8765,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("python.exe"),
+            "err should name the path: {err}"
+        );
+    }
+
+    #[test]
+    fn happy_path_builds_uvicorn_argv_and_token_env() {
+        let tmp = make_sidecar_dir();
+        let cmd = build_windows_sidecar_command(
+            &tmp.path().join("unused-launcher"),
+            Some(tmp.path()),
+            "tok-123",
+            9123,
+        )
+        .expect("command");
+
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        assert!(program.ends_with("python.exe"), "program: {program}");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.windows(2).any(|w| w[0] == "--port" && w[1] == "9123"));
+        assert!(args.iter().any(|a| a == "core.app:app"));
+        assert!(args.iter().any(|a| a == "--no-access-log"));
+        assert_eq!(
+            env_of(&cmd, "NEXE_TOKEN_INTERNAL").as_deref(),
+            Some("tok-123")
+        );
+        // The PBS is the boot interpreter, so PYTHONHOME points at python-runtime.
+        let home = env_of(&cmd, "PYTHONHOME").expect("PYTHONHOME present");
+        assert!(home.ends_with("python-runtime"), "home: {home}");
+        // cp1252 guard: the Windows sidecar stdio is forced to UTF-8 so a Unicode
+        // print() can't crash the process. PYTHONUTF8=1 alone (its surrogateescape
+        // handler); NOT PYTHONIOENCODING=utf-8, whose 'strict' handler would
+        // reintroduce the crash — assert it stays unset. See build-fn comment.
+        assert_eq!(env_of(&cmd, "PYTHONUTF8").as_deref(), Some("1"));
+        assert_eq!(env_of(&cmd, "PYTHONIOENCODING"), None);
+    }
+
+    #[test]
+    fn boots_pbs_directly_not_venv_launcher() {
+        // The venv launcher (Scripts\python.exe) can't resolve a relocatable relative
+        // pyvenv.cfg home on Windows, so we spawn python-runtime\python.exe directly and
+        // reach the venv deps via a relative .pth. Guard the choice against regressions.
+        let tmp = make_sidecar_dir();
+        let cmd = build_windows_sidecar_command(
+            &tmp.path().join("unused-launcher"),
+            Some(tmp.path()),
+            "tok",
+            8765,
+        )
+        .expect("command");
+        let program = cmd.get_program().to_string_lossy().replace('\\', "/");
+        assert!(
+            program.ends_with("python-runtime/python.exe"),
+            "must boot the PBS directly, got: {program}"
+        );
+        assert!(
+            !program.contains("venv/Scripts"),
+            "must NOT boot the venv launcher: {program}"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_tree_and_is_idempotent() {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(src.path().join("a").join("b")).unwrap();
+        std::fs::write(src.path().join("a").join("b").join("f.txt"), b"x").unwrap();
+        std::fs::write(src.path().join("root.txt"), b"y").unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let dst_root = dst.path().join("out");
+
+        copy_dir_recursive(src.path(), &dst_root).expect("first copy");
+        assert_eq!(
+            std::fs::read(dst_root.join("a").join("b").join("f.txt")).unwrap(),
+            b"x"
+        );
+        assert_eq!(std::fs::read(dst_root.join("root.txt")).unwrap(), b"y");
+
+        // Partially/fully existing destination must not fail (re-seed path).
+        copy_dir_recursive(src.path(), &dst_root).expect("second copy over existing");
+    }
+
+    #[test]
+    fn dev_fallback_resolves_dir_from_launcher_parent() {
+        let tmp = make_sidecar_dir();
+        // sidecar_data_dir = None (dev): the dir is the launcher's parent.
+        let cmd =
+            build_windows_sidecar_command(&tmp.path().join("nexe-sidecar"), None, "tok", 8765)
+                .expect("command");
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        assert!(program.starts_with(&tmp.path().to_string_lossy().into_owned()));
+    }
+}
+
 /// Spawn the sidecar process with auth token via stdin.
 ///
 /// N1: NEXE_SIDECAR=1 signals server-nexe to NOT kill processes on port conflict.
 /// N3: token is UUID v4 session key, not JWT. Written to stdin to avoid
-/// /proc/<pid>/environ leak.
+/// /proc/<pid>/environ leak. (Windows: token goes via child env instead —
+/// see `build_windows_sidecar_command`.)
 fn spawn_sidecar_process(
     sidecar_path: &Path,
     auth_token: &str,
@@ -144,16 +408,28 @@ fn spawn_sidecar_process(
         }
     }
 
+    // POSIX: the launcher script (nexe-sidecar, bash) resolves venv/app and
+    // reads the auth token from stdin. Windows (B3): no bash and no exec(2),
+    // so the venv python.exe is spawned directly and this function replicates
+    // the launcher's work inline (env, fastembed seed, token via child env).
+    #[cfg(not(windows))]
+    let mut cmd = Command::new(sidecar_path);
+    #[cfg(windows)]
+    let mut cmd = build_windows_sidecar_command(sidecar_path, sidecar_data_dir, auth_token, port)?;
+
     // macOS app bundles launch with a minimal PATH that omits /usr/local/bin
     // and /opt/homebrew/bin, so shutil.which("ollama") fails inside the sidecar
     // even when Ollama is installed. Prepend the standard tool locations so
     // Python can resolve externally-installed binaries (Ollama, ffmpeg, etc.).
-    let base_path = std::env::var("PATH").unwrap_or_default();
-    let augmented_path = format!("/usr/local/bin:/opt/homebrew/bin:/opt/local/bin:{base_path}");
-
-    let mut cmd = Command::new(sidecar_path);
-    cmd.env("PATH", augmented_path)
-        .env("NEXE_PORT", port.to_string())
+    // (Unix-only: these ':'-joined prefixes would corrupt the ';'-separated
+    // Windows PATH, and Windows inherits a complete PATH anyway.)
+    #[cfg(not(windows))]
+    {
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        let augmented_path = format!("/usr/local/bin:/opt/homebrew/bin:/opt/local/bin:{base_path}");
+        cmd.env("PATH", augmented_path);
+    }
+    cmd.env("NEXE_PORT", port.to_string())
         .env("NEXE_SERVER_PORT", port.to_string())   // server-nexe alias
         .env("NEXE_HOST", "127.0.0.1")
         .env("NEXE_SIDECAR", "1")
@@ -296,6 +572,26 @@ fn spawn_sidecar_process(
         tracing::error!(error = %e, "sidecar spawn failed");
         format!("sidecar spawn: {e}")
     })?;
+    // K-002: Windows counterpart of process_group(0). Ties the sidecar tree
+    // (python + grandchildren) to this process via a KILL_ON_JOB_CLOSE Job
+    // Object, so a Tauri crash can no longer leave orphans. The window
+    // between spawn() and the assignment is accepted for now: Python takes
+    // hundreds of ms before it can fork grandchildren (CREATE_SUSPENDED
+    // refinement deferred to the release hardening pass).
+    #[cfg(windows)]
+    {
+        if win_job::assign_to_sidecar_job(&child) {
+            tracing::info!(
+                pid = child.id(),
+                "sidecar assigned to KILL_ON_JOB_CLOSE job (K-002)"
+            );
+        } else {
+            tracing::warn!(
+                pid = child.id(),
+                "Job Object unavailable — relying on taskkill /T fallback only (K-002 partial)"
+            );
+        }
+    }
     if let Some(mut stdin) = child.stdin.take() {
         if let Err(e) = stdin.write_all(format!("{auth_token}\n").as_bytes()) {
             tracing::warn!(error = %e, "sidecar stdin write_all failed");
@@ -396,10 +692,45 @@ async fn poll_sidecar_health(
         // Hitting `/` returns the framework JSON identity payload — which
         // the webview would render as plain text — so always target /ui/.
         let ui_url = format!("http://127.0.0.1:{port}/ui/#nexe_api_key={encoded_key}");
-        if let Ok(url) = ui_url.parse() {
-            let _ = w.navigate(url);
-        } else {
-            tracing::warn!(port, "splash: failed to parse sidecar UI URL");
+
+        // macOS/Linux: WKWebView/WebKitGTK honour `navigate()` from any thread.
+        #[cfg(not(windows))]
+        {
+            match ui_url.parse() {
+                Ok(url) => {
+                    let nav_window = w.clone();
+                    if let Err(e) = w.run_on_main_thread(move || {
+                        match nav_window.navigate(url) {
+                            Ok(()) => tracing::info!(port, "splash: navigated webview to sidecar UI"),
+                            Err(e) => tracing::error!(error = %e, port, "splash: webview navigate failed"),
+                        }
+                    }) {
+                        tracing::error!(error = %e, port, "splash: run_on_main_thread failed");
+                    }
+                }
+                Err(_) => tracing::warn!(port, "splash: failed to parse sidecar UI URL"),
+            }
+        }
+
+        // Windows/WebView2 (B038): `navigate()` and `eval()` invoked from Rust do
+        // NOT change the page here — off the UI thread they are silent no-ops, and
+        // even marshalled onto the main thread WebView2 returns Ok(()) without
+        // navigating (verified empirically: log says Ok, window stays on splash).
+        // The one path that works on Windows is the native JS navigation the
+        // onboarding wizard already uses (step5-apikey.js: `window.location.
+        // replace(...)`). We hand the URL to the splash JS via an event and let
+        // main.js perform the navigation. The api_key in the URL fragment reaches
+        // the splash-origin JS context — the same trusted surface the wizard
+        // already relies on (local code, no plugin frames loaded yet, no user
+        // input). This is Windows-only; macOS keeps the navigate() path above so
+        // its key never transits the JS layer.
+        #[cfg(windows)]
+        {
+            use tauri::Emitter;
+            match w.emit("navigate-to-ui", &ui_url) {
+                Ok(()) => tracing::info!(port, "splash: emitted navigate-to-ui event to splash JS"),
+                Err(e) => tracing::error!(error = %e, port, "splash: emit navigate-to-ui failed"),
+            }
         }
     }
 }
@@ -625,6 +956,16 @@ async fn restart_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
 }
 
 fn setup_services(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // TOCTOU guard — MUST run before the sidecar extraction below writes
+    // `.extracted` for this very session: snapshot whether a PREVIOUS session
+    // left a partial install behind. `check_partial_install` reads this
+    // snapshot instead of the live filesystem (see onboarding_cmd.rs).
+    app.manage(crate::onboarding_cmd::PartialInstallAtBoot(
+        std::sync::atomic::AtomicBool::new(crate::onboarding_cmd::detect_partial_install(
+            app.handle(),
+        )),
+    ));
+
     app.manage(AuthToken::generate());
     app.manage(ApiKey::generate());
     tracing::info!("auth token + api key generated (uuid v4, 128 bits entropy each)");

@@ -20,6 +20,7 @@
   --text-strong: #eee;
   --text-ok: #4caf50;
   --text-warn: #ff9800;
+  --bg-accent-tint: #1a0a0a;
   --radius: 6px;
   --font-mono: 'JetBrains Mono', 'Courier New', monospace;
   --font-ui: system-ui, -apple-system, sans-serif;
@@ -34,6 +35,7 @@
   --text: #333;
   --text-dim: #888;
   --text-strong: #111;
+  --bg-accent-tint: #fdecec;
 }
 
 * {
@@ -337,7 +339,7 @@ p {
 }
 
 .dropdown-item.selected {
-  background: #1a0a0a;
+  background: var(--bg-accent-tint);
 }
 
 .dropdown-flag {
@@ -527,7 +529,7 @@ p {
 
 .model-item.selected {
   border-color: var(--accent);
-  background: #1a0a0a;
+  background: var(--bg-accent-tint);
 }
 
 .model-name {
@@ -702,7 +704,7 @@ p {
   width: 56px;
   height: 56px;
   border-radius: 50%;
-  background: #1a0a0a;
+  background: var(--bg-accent-tint);
   border: 2px solid var(--accent);
   display: flex;
   align-items: center;

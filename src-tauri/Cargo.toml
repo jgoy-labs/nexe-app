@@ -1,6 +1,6 @@
 [package]
 name = "nexe-app"
-version = "1.0.6"
+version = "1.0.7"
 description = "Tauri v2 desktop app (nexe-app starter template)"
 authors = ["Jordi Goy <jgoy@jgoy.net>"]
 edition = "2021"
@@ -102,6 +102,19 @@ sysinfo = "0.38"
 # tauri-plugin-opener: reintroduir quan Fase 3 ho requereixi per l'agent (obrir URLs externes)
 # tauri-plugin-clipboard-manager — opcional per a imatges/HTML al clipboard. Activar a Fase 1+.
 # tauri-plugin-clipboard-manager = { version = "2", optional = true }
+
+# K-002 (2026-06-11): Job Object KILL_ON_JOB_CLOSE — el sidecar i els seus
+# néts (Ollama, model runners) moren amb el procés Tauri encara que el pare
+# crashegi sense passar per la kill path. `windows-sys` oficial de Microsoft
+# (mínim risc supply-chain, suport aarch64-pc-windows-msvc), target-gated.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION viu sota aquesta gate a 0.59
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

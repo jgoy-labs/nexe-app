@@ -192,13 +192,13 @@ jobs:
           - runner: windows-latest
             display_name: Windows x64
             target: x86_64-pc-windows-msvc
-            artifact_glob: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi'
+            artifact_glob: 'src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe'
           # C23: Windows ARM64 — cross-compile aarch64-pc-windows-msvc
           # NOTE: binari no verificat en runtime (cross-compile); marcat "unverified runtime" al release body.
           - runner: windows-latest
             display_name: Windows ARM64
             target: aarch64-pc-windows-msvc
-            artifact_glob: 'src-tauri/target/aarch64-pc-windows-msvc/release/bundle/msi/*.msi'
+            artifact_glob: 'src-tauri/target/aarch64-pc-windows-msvc/release/bundle/nsis/*-setup.exe'
     runs-on: ${{ matrix.platform.runner }}
     steps:
       # C24: persist-credentials: false

@@ -2276,7 +2276,7 @@ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
 
 [[package]]
 name = "nexe-app"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "dirs",
  "flate2",
@@ -2302,6 +2302,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

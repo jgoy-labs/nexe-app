@@ -8,6 +8,25 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions follo
 
 ## [Unreleased]
 
+## [1.0.7] — 2026-07-04
+
+### Added
+
+- **Windows 11 ARM64 installer (NSIS):** portable sidecar bundle, WebView2, onboarding wizard in Catalan/Spanish/English, and a Job Object that ties the sidecar process tree to the app so they are torn down together.
+- **Mac-driven Windows build tool** (`scripts/build-windows-installer.sh`): ships fresh source via git bundles, guards against stale builds, and retrieves the installer back to the Mac with a SHA256 check.
+- **`docs/BUILDING.md`:** one umbrella page covering the three installer paths (macOS, Linux, Windows).
+
+### Changed
+
+- App and installer icons aligned with the macOS red-chevron mark.
+
+### Fixed
+
+- False "previous install incomplete" banner (boot-time state snapshot) and a full onboarding reset path.
+- Windows sidecar spawn forces `PYTHONUTF8=1`, avoiding a cp1252 crash on unicode output.
+- Theme-aware accent tint in the wizard (dark accent on light mode) and a Windows tray-overflow hint.
+- UI now renders on Windows (WebView2 navigation fix).
+
 ## [1.0.6] — 2026-06-07
 
 ### Security

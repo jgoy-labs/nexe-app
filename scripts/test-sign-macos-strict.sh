@@ -79,10 +79,10 @@ run_sign() {
         PATH="$STUBBIN:$PATH" \
         NEXE_STRICT_SIGNING=1 \
         SPCTL_DMG_RESULT="$dmg_result" \
-        TAURI_SIGNING_IDENTITY="Developer ID Application: Test (TEAMID1234)" \
+        TAURI_SIGNING_IDENTITY="Developer ID Application: Test (XXXXXXXXXX)" \
         TAURI_APPLE_ID="test@example.com" \
         TAURI_APPLE_PASSWORD="@keychain:AC_PASSWORD" \
-        TAURI_APPLE_TEAM_ID="TEAMID1234" \
+        TAURI_APPLE_TEAM_ID="XXXXXXXXXX" \
         bash "$TMPDIR_TEST/scripts/sign-macos.sh" 2>&1)"
     EXIT_CODE=$?
     set -e

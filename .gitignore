@@ -50,6 +50,8 @@ src-tauri/sidecar-bundle.tar.gz
 # (sidecar.rs) per detectar re-builds dins la mateixa CARGO_PKG_VERSION.
 src-tauri/sidecar-bundle.sha256
 
+# Internal audit artifacts (DEV-only, not for OSS)
+.muthur/
 
 # Python (si s'afegeix sidecar amb venv local)
 __pycache__/
@@ -60,13 +62,19 @@ venv/
 .coverage.*
 htmlcov/
 
-# Local dev notes and artifacts (not source)
-notes/
-*.notes.md
+# Internal vault docs — NEVER push to OSS repo (DEV-only)
+20*_closeout_*.md
+20*_auditoria_*.md
+DIARI-*.md
+diari/
 index_nexe-app.md
 README-nexe-app.md
+SOURCE_OF_TRUTH.md
+LLICONS_APRESES.md
+consultoria.md
+nexe-app.PREV-META-*/
 
-# Sidecar runtime dirs (regenerats al primer launch dev/Tauri)
+# F5.6 — sidecar runtime dirs (regenerats al primer launch dev/Tauri)
 storage/
 personality/
 src-tauri/storage/
@@ -74,3 +82,4 @@ src-tauri/personality/
 
 # Scratch local de desenvolupament (no codi font)
 dev-tools/
+/win-artifacts/

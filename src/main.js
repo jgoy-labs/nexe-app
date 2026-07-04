@@ -9,6 +9,7 @@
 
 import { fetchFromSidecar, getSidecarPort } from "./api/commands.js";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 // -----------------------------------------------------------------------------
 // Plugin postMessage firewall (ADR-0007 / ADR-0008 baseline + source-validation hardening).
@@ -166,6 +167,19 @@ window.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
+    // B038 (Windows/WebView2): WebView2 ignores `navigate()`/`eval()` issued
+    // from Rust, so on Windows the Rust health-poll hands us the destination
+    // URL (with the api_key in its fragment) via this event and we navigate
+    // ourselves — the one path that works on WebView2, identical to the
+    // onboarding wizard (step5-apikey.js). On macOS this event is never emitted
+    // (Rust calls navigate() directly), so the listener stays inert. Registered
+    // before the health poll so the event is never missed; it only records the
+    // URL — the actual navigation waits until /ui/ is confirmed reachable.
+    let pendingNavUrl = null;
+    await listen("navigate-to-ui", (event) => {
+      if (event?.payload) pendingNavUrl = event.payload;
+    });
+
     const port = await getSidecarPort();
     const healthUrl = `http://127.0.0.1:${port}/admin/system/health`;
     const deadline = Date.now() + HEALTH_TIMEOUT_MS;
@@ -176,14 +190,47 @@ window.addEventListener("DOMContentLoaded", async () => {
       setStatus(secs > 0 ? `iniciant… (${secs}s)` : "iniciant…");
       try {
         await fetchFromSidecar(healthUrl, "GET", null);
-        // Sidecar is healthy. Rust `poll_sidecar_health` will navigate the
-        // webview to http://127.0.0.1:{port}/ui/#nexe_api_key=... right after
-        // its own health check passes (typically within the next poll tick).
-        // The key is passed via URL fragment (not query-param) so it never
-        // appears in access logs (K-001). Hold the spinner here; if Rust does
-        // not navigate within a small grace window, surface a timeout below.
         setStatus("");
-        await new Promise((r) => setTimeout(r, 5_000));
+        // Sidecar is healthy. Navigation to the UI is driven by Rust:
+        // - macOS/Linux: `poll_sidecar_health` calls webview `navigate()`, which
+        //   replaces this page; the wait below simply times out into the error.
+        // - Windows: it emitted `navigate-to-ui` (recorded above). Before
+        //   navigating we poll /ui/ until it serves — WebView2 issues the GET on
+        //   a fresh connection and does NOT retry, so navigating the instant the
+        //   health endpoint flips to 200 can hit "connection refused".
+        const navDeadline = Date.now() + 10_000;
+        while (!pendingNavUrl && Date.now() < navDeadline) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (pendingNavUrl) {
+          const uiUrl = pendingNavUrl.split("#")[0];
+          // Wait until /ui/ accepts a *connection*, not a specific HTTP status:
+          // `fetchFromSidecar` resolves with the body (or throws on a network
+          // error) — it does not surface the status code. The race we guard
+          // against is WebView2 hitting "connection refused" before the socket
+          // is accepting; once any request succeeds, /ui/ (a mounted router on a
+          // healthy sidecar) is serving. So a successful call is enough to stop.
+          for (let i = 0; i < 40; i++) {
+            try {
+              await fetchFromSidecar(uiUrl, "GET", null);
+              break;
+            } catch {
+              await new Promise((r) => setTimeout(r, 250));
+            }
+          }
+          // WebView2 refuses the loopback IP literal 127.0.0.1 (network
+          // isolation) but honours the `localhost` hostname, which Edge exempts
+          // from loopback blocking automatically. The sidecar binds 127.0.0.1
+          // and `localhost` resolves there, so swap the host for the navigation
+          // only (URL API to touch the hostname only, never the port/fragment).
+          // The health/ui probes above keep using 127.0.0.1 because the Rust
+          // `fetch_from_sidecar` allowlist validates that exact host.
+          const navUrl = new URL(pendingNavUrl);
+          navUrl.hostname = "localhost";
+          pendingNavUrl = null;
+          window.location.replace(navUrl.href);
+          return;
+        }
         showError("El servidor està actiu però la finestra no ha pogut canviar. Tanca i reobre l'app.");
         return;
       } catch {

@@ -20,14 +20,26 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # that uv downloaded, regardless of the platform.
 OS=$(uname -s)
 ARCH=$(uname -m)
-case "$OS-$ARCH" in
-    Darwin-arm64)   PBS_TRIPLE="aarch64-apple-darwin" ;;
-    Darwin-x86_64)  PBS_TRIPLE="x86_64-apple-darwin" ;;
-    Linux-aarch64)  PBS_TRIPLE="aarch64-unknown-linux-gnu" ;;
-    Linux-x86_64)   PBS_TRIPLE="x86_64-unknown-linux-gnu" ;;
+# OS_KIND normalises the platform family. On Windows the build runs under
+# Git-for-Windows / MSYS2, where `uname -s` reports MINGW64_NT-* / MSYS_NT-* and
+# `uname -m` LIES (reports x86_64 for the x86-emulated bash even on ARM64). We
+# force the target arch to aarch64 — what matters is the PBS/wheel target, not
+# the shell's arch. Empirically confirmed on the Win11 ARM64 VM (2026-07-01).
+case "$OS" in
+    Darwin)               OS_KIND=macos ;;
+    Linux)                OS_KIND=linux ;;
+    MINGW*|MSYS*|CYGWIN*) OS_KIND=windows; ARCH=aarch64 ;;
     *) echo "Unsupported platform: $OS-$ARCH" >&2; exit 1 ;;
 esac
-echo "Detected: $OS/$ARCH → PBS_TRIPLE=$PBS_TRIPLE"
+case "$OS_KIND-$ARCH" in
+    macos-arm64)     PBS_TRIPLE="aarch64-apple-darwin" ;;
+    macos-x86_64)    PBS_TRIPLE="x86_64-apple-darwin" ;;
+    linux-aarch64)   PBS_TRIPLE="aarch64-unknown-linux-gnu" ;;
+    linux-x86_64)    PBS_TRIPLE="x86_64-unknown-linux-gnu" ;;
+    windows-aarch64) PBS_TRIPLE="aarch64-pc-windows-msvc" ;;
+    *) echo "Unsupported platform: $OS_KIND-$ARCH" >&2; exit 1 ;;
+esac
+echo "Detected: $OS/$ARCH → OS_KIND=$OS_KIND PBS_TRIPLE=$PBS_TRIPLE"
 
 # ── Config ────────────────────────────────────────────────────────────
 PY_VERSION="3.12"
@@ -39,6 +51,37 @@ APP_MODULE="${APP_MODULE:-poc-sidecar/app.py}"
 #   APP_SOURCE_DIR=/path/to/server-nexe REQUIREMENTS=/path/to/requirements.txt \
 #   scripts/build-sidecar.sh
 APP_SOURCE_DIR="${APP_SOURCE_DIR:-}"
+
+# ── Per-OS venv / interpreter layout ──────────────────────────────────
+# POSIX venvs: bin/ + lib/pythonX.Y/site-packages, python under bin/. Windows
+# venvs: Scripts/ + Lib/site-packages, python.exe a real copy (NO symlinks), and
+# the PBS ships python.exe at its ROOT. These vars replace every previously
+# hardcoded venv/bin/python3 / lib/pythonX.Y path so the same script builds on
+# all three platforms.
+if [ "$OS_KIND" = windows ]; then
+    VENV_BIN="Scripts"
+    VENV_PY_REL="Scripts/python.exe"
+    SITE_PACKAGES_REL="Lib/site-packages"
+    PYVENV_HOME_REL="../python-runtime"
+else
+    VENV_BIN="bin"
+    VENV_PY_REL="bin/python3"
+    SITE_PACKAGES_REL="lib/python${PY_VERSION}/site-packages"
+    PYVENV_HOME_REL="../python-runtime/bin"
+fi
+
+# BOOT_PY = the interpreter that BOOTS the sidecar (validate / smoke / boot gates),
+# distinct from VENV_PY (used to INSTALL into the venv). On Windows the venv launcher
+# (Scripts\python.exe) is a redirector that cannot resolve a relocatable relative
+# pyvenv.cfg home once the bundle moves — so we boot the PBS directly
+# (python-runtime\python.exe) and expose the venv packages via a relative .pth
+# (Step 5.5b). On POSIX BOOT_PY is just the venv python. Empirically validated on
+# Win11 ARM64 (2026-07-01). SIDECAR_DIR is already set above (Config).
+if [ "$OS_KIND" = windows ]; then
+    BOOT_PY="$SIDECAR_DIR/python-runtime/python.exe"
+else
+    BOOT_PY="$SIDECAR_DIR/venv/$VENV_PY_REL"
+fi
 
 # ── Pre-checks ────────────────────────────────────────────────────────
 if ! command -v uv &>/dev/null; then
@@ -67,12 +110,30 @@ mkdir -p "$SIDECAR_DIR"
 # and the bundle is not portable. Empirically validated on the Linux test VM 2026-05-22 evening.
 echo "==> Creating venv with Python $PY_VERSION (PBS via uv, managed)..."
 START_VENV=$(date +%s)
-uv venv "$SIDECAR_DIR/venv" --python "$PY_VERSION" --managed-python --quiet
+if [ "$OS_KIND" = windows ]; then
+    # uv / python-build-standalone has NO windows-aarch64 PBS (only x86_64), verified via
+    # `uv python list --all-platforms`. --managed-python would silently download an x86_64
+    # PBS that runs EMULATED under WOW64. For a native ARM64 sidecar we point uv at an
+    # explicit ARM64 PBS root (NEXE_WIN_PBS, containing python.exe + Lib\ + DLLs\).
+    if [ -z "${NEXE_WIN_PBS:-}" ] || [ ! -f "$NEXE_WIN_PBS/python.exe" ]; then
+        echo "ERROR: Windows ARM64 build requires NEXE_WIN_PBS to point at an ARM64" >&2
+        echo "       python-build-standalone root (with python.exe). uv has no" >&2
+        echo "       windows-aarch64 PBS. Got NEXE_WIN_PBS='${NEXE_WIN_PBS:-<unset>}'." >&2
+        exit 1
+    fi
+    echo "    Using explicit ARM64 PBS: $NEXE_WIN_PBS"
+    # uv is a native Windows binary — feed it a Windows path (cygpath -w), while the
+    # -f test above uses the unix form ($NEXE_WIN_PBS is /c/nexe/python under git-bash).
+    WIN_PBS_PY=$(cygpath -w "$NEXE_WIN_PBS/python.exe" 2>/dev/null || echo "$NEXE_WIN_PBS/python.exe")
+    uv venv "$SIDECAR_DIR/venv" --python "$WIN_PBS_PY" --quiet
+else
+    uv venv "$SIDECAR_DIR/venv" --python "$PY_VERSION" --managed-python --quiet
+fi
 END_VENV=$(date +%s)
 echo "    Venv created in $((END_VENV - START_VENV))s"
 
 # Verify the Python is from PBS (not system)
-VENV_PY="$SIDECAR_DIR/venv/bin/python3"
+VENV_PY="$SIDECAR_DIR/venv/$VENV_PY_REL"
 PY_PREFIX=$("$VENV_PY" -c "import sys; print(sys.base_prefix)")
 echo "    Python prefix: $PY_PREFIX"
 echo "    Python version: $("$VENV_PY" --version)"
@@ -80,7 +141,42 @@ echo "    Python version: $("$VENV_PY" --version)"
 # ── Step 3: Install dependencies ─────────────────────────────────────
 echo "==> Installing dependencies..."
 START_DEPS=$(date +%s)
-if [ -f "$REQUIREMENTS" ]; then
+if [ "$OS_KIND" = windows ] && [ -n "${APP_SOURCE_DIR:-}" ]; then
+    # ── Windows ARM64 dependency path ─────────────────────────────────
+    # Do NOT install requirements.txt as-is: it pulls qdrant-client (grpcio has
+    # no win_arm64 wheel) and, via uvicorn[standard], httptools (no wheel). We
+    # install a windows-adapted requirements file + qdrant --no-deps + the
+    # vendored grpc-shim. Ollama-only inference on the first Windows release
+    # (MLX is Apple-only; llama-cpp deferred like the Linux path).
+    REQ_WIN="$APP_SOURCE_DIR/requirements-windows.txt"
+    if [ ! -f "$REQ_WIN" ]; then
+        echo "ERROR: requirements-windows.txt not found at $REQ_WIN (required for win_arm64)" >&2
+        exit 1
+    fi
+    echo "    Installing Windows ARM64 deps from $REQ_WIN..."
+    uv pip install --python "$VENV_PY" -r "$REQ_WIN" --quiet
+    # qdrant-client WITHOUT deps: grpcio has no win_arm64 wheel and is never used
+    # (embedded/local mode, prefer_grpc=False). Its unconditional `import grpc`
+    # (core/qdrant_pool.py) is satisfied by the vendored shim installed just below.
+    echo "    Installing qdrant-client==1.18.0 (--no-deps) + pure-python runtime deps..."
+    uv pip install --python "$VENV_PY" --no-deps "qdrant-client==1.18.0" --quiet
+    # qdrant runtime deps (pure-python): portalocker + protobuf + urllib3. urllib3 is
+    # imported AT qdrant import time (qdrant_remote.py: `from urllib3.util import ...`) even
+    # in embedded/local mode; declare it explicitly rather than relying on fastembed's
+    # transitive requests->urllib3 edge (which would break the server if fastembed changes).
+    uv pip install --python "$VENV_PY" "portalocker>=2.7.0" "protobuf>=4.21" "urllib3>=1.26.14,<3" --quiet
+    # Vendored grpc-shim (2 tiny files, generic dummy metaclass) copied verbatim
+    # from the repo into site-packages/grpc so qdrant's import resolves. NOT a real
+    # gRPC client — any actual gRPC call path would (correctly) fail.
+    GRPC_SHIM_SRC="$APP_SOURCE_DIR/installer/win/grpc_shim"
+    if [ ! -d "$GRPC_SHIM_SRC" ]; then
+        echo "ERROR: grpc-shim not found at $GRPC_SHIM_SRC (qdrant would fail to import grpc)" >&2
+        exit 1
+    fi
+    echo "    Installing vendored grpc-shim into site-packages/grpc..."
+    rm -rf "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL/grpc"
+    cp -R "$GRPC_SHIM_SRC" "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL/grpc"
+elif [ -f "$REQUIREMENTS" ]; then
     uv pip install --python "$VENV_PY" -r "$REQUIREMENTS" --quiet
 
     # Platform-specific deps. If APP_SOURCE_DIR is set and contains a
@@ -180,20 +276,53 @@ if [ -n "$APP_SOURCE_DIR" ]; then
     #
     # Root cause — the recurring smoke instability
     # comes from DEV contamination inside the bundle: .test_venv/ test Python
-    # venv, node_modules/, scripts/, docs/, knowledge/, README*.md and
+    # venv, node_modules/, scripts/, docs/, README*.md and
     # pytest configs were included in sidecar/app/. The .test_venv in particular
     # exposed .pth files on sys.path that made the module_manager
     # discover plugins in the dev source dir (server-nexe/plugins/) instead
     # of the extracted sidecar. Each fix uncovered a new layer.
     #
+    # NOTE: knowledge/ is deliberately NOT on the denylist — it MUST ship in the
+    # bundle. It carries the precomputed RAG embeddings (knowledge/.embeddings/*.npz,
+    # loaded into Qdrant at first boot) and the source docs the RAG serves. Adding
+    # knowledge/ here would silently break RAG (docs never load, no visible error).
+    #
     # Leading slash in /pattern = anchored to $APP_SOURCE_DIR; without a slash it
     # matches at any depth (which is why, without a slash, it also excludes
     # memory/memory/storage/, a real Python module that we do NOT want excluded).
+    if [ "$OS_KIND" = windows ]; then
+        # No rsync in Git-for-Windows. Copy the whole tree then prune the same
+        # denylist rsync applies below (tar --exclude glob semantics differ across
+        # GNU/bsdtar; explicit copy+prune is predictable). verify-privacy-gate.sh is the net.
+        cp -R "$APP_SOURCE_DIR/." "$SIDECAR_DIR/app/"
+        ( cd "$SIDECAR_DIR/app" && rm -rf \
+            storage .env .git diari tests InstallNexe.app Nexe.app .muthur dev-tools \
+            .test_venv .venv .test_data worktrees .github .grimp_cache .ruff_cache \
+            node_modules .pytest_cache .mypy_cache .coverage docs specialists scripts \
+            SetupNexe.command setup.sh nexe eslint.config.js package.json package-lock.json \
+            pytest.ini pytest-full.ini conftest.py .module_cache.json \
+            installer/swift-wizard installer/NexeTray.app installer/tray_icons \
+            installer/build_dmg.sh installer/build-embedding-bundle.sh \
+            installer/build-ollama-bundle.sh installer/build-python-bundle.sh \
+            installer/build-wheels-bundle.sh installer/sign-wheels-bundle.sh \
+            installer/install.py installer/install_headless.py installer/tray.py \
+            installer/tray_monitor.py installer/tray_translations.py installer/tray_uninstaller.py \
+            installer/nexe_launcher.swift installer/make_dmg_ds_store.py \
+            installer/dmg_background.png installer/logo.png \
+            installer/ollama-checksums.txt installer/wheels-checksums.txt 2>/dev/null || true
+          rm -rf README*.md CHANGELOG.md LICENSE SECURITY.md THREAT_MODEL.md \
+            CODE_OF_CONDUCT.md CONTRIBUTING.md COMMANDS.md index_server-nexe.md 2>/dev/null || true
+          find . -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name '*.egg-info' -exec rm -rf {} + 2>/dev/null || true
+          find . -name '.DS_Store' -delete 2>/dev/null || true
+          find . -name '._*' -delete 2>/dev/null || true )
+        echo "    Windows copy+prune done (denylist parity with rsync)"
+    else
     rsync -a \
         --exclude='/storage' --exclude='.env' --exclude='/.git' \
         --exclude='__pycache__' --exclude='/venv' --exclude='/diari' \
         --exclude='/tests' --exclude='/InstallNexe.app' --exclude='/Nexe.app' \
-        --exclude='/dev-tools' \
+        --exclude='/.muthur' --exclude='/dev-tools' \
         --exclude='/.test_venv' --exclude='/.venv' \
         --exclude='/.test_data' --exclude='/worktrees' \
         --exclude='/.github' --exclude='/.grimp_cache' --exclude='/.ruff_cache' \
@@ -232,6 +361,7 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         --exclude='/installer/ollama-checksums.txt' \
         --exclude='/installer/wheels-checksums.txt' \
         "$APP_SOURCE_DIR/." "$SIDECAR_DIR/app/"
+    fi
     # We include the installer/ Python modules that the sidecar
     # imports at runtime — installer_ollama_install (ensure_ollama_installed),
     # download_verify (verify_download_integrity), installer_catalog_data
@@ -293,7 +423,10 @@ if [ -n "${APP_SOURCE_DIR:-}" ]; then
     fi
 fi
 
-# ── Step 5: Create launcher script ───────────────────────────────────
+# ── Step 5: Create launcher script (POSIX only) ──────────────────────
+# On Windows the runtime spawns venv\Scripts\python.exe -m uvicorn directly
+# (lib.rs build_windows_sidecar_command) — no bash launcher is generated.
+if [ "$OS_KIND" != windows ]; then
 cat > "$SIDECAR_DIR/nexe-sidecar" << 'LAUNCHER'
 #!/bin/bash
 # Launcher for nexe-sidecar — self-contained Python server
@@ -360,6 +493,9 @@ exec "$VENV_PY" -m uvicorn core.app:app \
     --app-dir "$SIDECAR_DIR/app"
 LAUNCHER
 chmod +x "$SIDECAR_DIR/nexe-sidecar"
+else
+    echo "==> Step 5 (bash launcher) skipped on Windows — runtime uses direct python.exe spawn"
+fi
 
 # ── Step 5.5: Copy Python Build Standalone into bundle ──────────────
 # Root bug discovered 2026-05-18: `uv venv` creates absolute symlinks to the
@@ -369,20 +505,44 @@ chmod +x "$SIDECAR_DIR/nexe-sidecar"
 # the entire PBS into the bundle, make the symlinks relative, make pyvenv.cfg
 # relocatable. Empirically validated 2026-05-18.
 echo "==> Copying PBS runtime into bundle (portable)..."
-# Resolve the real PBS directory from the absolute symlink created by uv venv:
-# venv/bin/python -> .../bin/python3.12, two dirname calls to reach the PBS root.
-PBS_REAL=$(realpath "$SIDECAR_DIR/venv/bin/python")
-PBS_DIR=$(dirname "$(dirname "$PBS_REAL")")
+# PBS root resolved from the interpreter itself (Step 2 already computed base_prefix
+# as PY_PREFIX). Platform-agnostic: on Windows uv creates no venv symlink for realpath
+# to follow, and sys.base_prefix is the PBS root on all platforms.
+PBS_DIR="$PY_PREFIX"
 echo "    PBS source: $PBS_DIR"
 mkdir -p "$SIDECAR_DIR/python-runtime"
-# rsync -a preserves intra-PBS symlinks and permissions. Excludes include/ (~8 MB
-# headers for compilation, not needed at runtime) and share/ (~1 MB doc).
-rsync -a --delete \
-    --exclude='include/' \
-    --exclude='share/' \
-    "$PBS_DIR/" "$SIDECAR_DIR/python-runtime/"
+if [ "$OS_KIND" = windows ]; then
+    # No rsync in Git-for-Windows. tar copy-through (PBS Windows ships no symlinks).
+    # Exclude include/ (headers) + share/ (docs) like the POSIX path.
+    tar -C "$PBS_DIR" --exclude='./include' --exclude='./share' -cf - . \
+        | tar -C "$SIDECAR_DIR/python-runtime" -xf -
+else
+    # rsync -a preserves intra-PBS symlinks and permissions. Excludes include/ (~8 MB
+    # headers for compilation, not needed at runtime) and share/ (~1 MB doc).
+    rsync -a --delete \
+        --exclude='include/' \
+        --exclude='share/' \
+        "$PBS_DIR/" "$SIDECAR_DIR/python-runtime/"
+fi
 PBS_SIZE=$(du -sh "$SIDECAR_DIR/python-runtime" | cut -f1)
 echo "    PBS copied: $PBS_SIZE"
+
+# ── Step 5.5b: link PBS -> venv site-packages via a relative .pth (Windows) ──
+# The venv launcher can't resolve a relocatable relative home, so the runtime boots
+# the PBS directly. A RELATIVE .pth in the PBS site-packages exposes the venv's
+# installed packages to the PBS, resolving wherever the bundle is extracted:
+# from python-runtime\Lib\site-packages, `..\..\..\venv\Lib\site-packages` climbs to
+# the bundle root then into the venv. Portable (no absolute path). Validated 2026-07-01.
+if [ "$OS_KIND" = windows ]; then
+    # Use an `import ...; addsitedir(...)` line (NOT a bare path) so the venv's OWN .pth
+    # files are also processed — pywin32 ships a bootstrap .pth that registers its DLLs
+    # (pywintypes/pythoncom), which portalocker's Win32Locker (qdrant local) needs. A bare
+    # path line only appends to sys.path and skips those. sys.prefix is the PBS root
+    # (python-runtime); ..\venv\Lib\site-packages resolves portably at any extract location.
+    printf "import site, os, sys; site.addsitedir(os.path.join(sys.prefix, '..', 'venv', 'Lib', 'site-packages'))\r\n" \
+        > "$SIDECAR_DIR/python-runtime/$SITE_PACKAGES_REL/nexe_venv.pth"
+    echo "    Wrote addsitedir .pth: PBS -> ..\\venv\\Lib\\site-packages (processes venv .pth too)"
+fi
 
 # ── Step 5.6: Rewrite venv symlinks relatively ──────────────────────
 # The 3 venv/bin/ symlinks (python, python3, python3.12) now point to the
@@ -391,12 +551,16 @@ echo "    PBS copied: $PBS_SIZE"
 # ~/Library/Application Support/com.nexe.app/sidecar/, the symlinks resolve
 # correctly inside the extracted directory.
 echo "==> Rewriting venv symlinks to relative PBS paths..."
+if [ "$OS_KIND" != windows ]; then
 ( cd "$SIDECAR_DIR/venv/bin" && \
     rm -f python python3 python3.12 && \
     ln -sf ../../python-runtime/bin/python3.12 python3.12 && \
     ln -sf ../../python-runtime/bin/python3.12 python3 && \
     ln -sf python3 python )
 echo "    Symlinks: python, python3, python3.12 -> ../../python-runtime/bin/python3.12"
+else
+    echo "    Step 5.6 skipped on Windows (venv\\Scripts\\python.exe is a real copy; bundle is symlink-free)"
+fi
 
 # ── Step 5.7: Rewrite pyvenv.cfg relocatable ────────────────────────
 # Replaces `home = $HOME/.local/share/uv/python/.../bin` with a relative
@@ -408,20 +572,20 @@ echo "    Symlinks: python, python3, python3.12 -> ../../python-runtime/bin/pyth
 # robust configuration (source: CPython Lib/site.py).
 echo "==> Rewriting pyvenv.cfg for relocatable PBS..."
 UV_VERSION_STR=$(uv --version 2>/dev/null | awk '{print $2}')
-# home= is RELATIVE to the pyvenv.cfg directory (CPython Lib/site.py resolves with
-# os.path.join(os.path.dirname(cfg_path), home)). pyvenv.cfg lives at
-# target/sidecar/venv/pyvenv.cfg → cfg directory = venv/ → `..` is
-# target/sidecar/ → `../python-runtime/bin` points to the sibling PBS. ONLY one
-# `..` level (not two), because the cfg lives in venv/, not venv/bin/.
+PY_FULL_VERSION=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import platform; print(platform.python_version())" 2>/dev/null || echo "3.12.0")
+# home= is RELATIVE to the pyvenv.cfg directory (venv/). POSIX PBS keeps python under
+# bin/ (home=../python-runtime/bin); Windows PBS ships python.exe at its ROOT
+# (home=../python-runtime). $PYVENV_HOME_REL is set per-OS at the top. version_info is
+# derived from the interpreter (was hardcoded 3.12.11, brittle on a PY_VERSION bump).
 cat > "$SIDECAR_DIR/venv/pyvenv.cfg" <<PYVENV
-home = ../python-runtime/bin
+home = $PYVENV_HOME_REL
 implementation = CPython
 uv = ${UV_VERSION_STR}
-version_info = 3.12.11
+version_info = ${PY_FULL_VERSION}
 include-system-site-packages = false
 relocatable = true
 PYVENV
-echo "    pyvenv.cfg rewritten with relative home + relocatable"
+echo "    pyvenv.cfg rewritten (home=$PYVENV_HOME_REL, version=$PY_FULL_VERSION)"
 
 # ── Step 5.8: Portability verification (Gates G1-G6) ─────────────────
 echo "==> Portability verification..."
@@ -438,28 +602,39 @@ echo "    G1 PASS: no absolute symlinks"
 # G2: venv/bin/python3 resolves to a real Mach-O (macOS) / ELF (Linux).
 # Cross-platform gate via $OS detected at top. NOTE: $OS is HOST OS; for future
 # cross-build (Mac → Linux target), introduce $TARGET_OS explicitly.
-VENV_PY_LINK="$SIDECAR_DIR/venv/bin/python3"
-if ! command -v file &>/dev/null; then
+VENV_PY_LINK="$SIDECAR_DIR/venv/$VENV_PY_REL"
+if ! command -v file &>/dev/null && [ "$OS_KIND" != windows ]; then
     echo "    G2 FAIL: 'file' command not found (install: apt-get install -y file / brew install file)"
     exit 1
 fi
-PY_TYPE=$(file -L "$VENV_PY_LINK" 2>/dev/null)
-case "$OS" in
-    Darwin)
+case "$OS_KIND" in
+    macos)
+        PY_TYPE=$(file -L "$VENV_PY_LINK" 2>/dev/null)
         if ! echo "$PY_TYPE" | grep -q "Mach-O 64-bit executable arm64"; then
-            echo "    G2 FAIL: venv/bin/python3 is not a Mach-O arm64 executable"
+            echo "    G2 FAIL: venv python is not a Mach-O arm64 executable"
             echo "    file: $PY_TYPE"
             exit 1
         fi
-        echo "    G2 PASS: venv/bin/python3 resolves to Mach-O arm64"
+        echo "    G2 PASS: venv python resolves to Mach-O arm64"
         ;;
-    Linux)
+    linux)
+        PY_TYPE=$(file -L "$VENV_PY_LINK" 2>/dev/null)
         if ! echo "$PY_TYPE" | grep -qE "ELF 64-bit LSB.*executable.*(ARM aarch64|x86-64)"; then
-            echo "    G2 FAIL: venv/bin/python3 is not an ELF 64-bit aarch64/x86_64 executable"
+            echo "    G2 FAIL: venv python is not an ELF 64-bit aarch64/x86_64 executable"
             echo "    file: $PY_TYPE"
             exit 1
         fi
-        echo "    G2 PASS: venv/bin/python3 resolves to ELF 64-bit ($ARCH)"
+        echo "    G2 PASS: venv python resolves to ELF 64-bit ($ARCH)"
+        ;;
+    windows)
+        # Validate a real PE executable via the 'MZ' magic (first two bytes), without
+        # relying on `file` output strings. venv\Scripts\python.exe must be a real copy.
+        PY_MAGIC=$(head -c 2 "$VENV_PY_LINK" 2>/dev/null)
+        if [ "$PY_MAGIC" != "MZ" ]; then
+            echo "    G2 FAIL: venv Scripts/python.exe is not a PE executable (magic='$PY_MAGIC')"
+            exit 1
+        fi
+        echo "    G2 PASS: venv Scripts/python.exe is a PE executable (MZ)"
         ;;
 esac
 
@@ -467,9 +642,17 @@ esac
 # Simulates the real launcher: PYTHONHOME points to the PBS inside the bundle. Without
 # PYTHONHOME, uv's PBS has a hardcoded prefix (/install) that fails. The
 # launcher ALWAYS defines it (Step 5), which is why the test does too.
-SYS_EXEC=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY_LINK" -c "import sys; print(sys.executable)")
-case "$SYS_EXEC" in
-    "$SIDECAR_DIR"/*)
+SYS_EXEC=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import sys; print(sys.executable)")
+if [ "$OS_KIND" = windows ]; then
+    # Windows python prints C:\...\python.exe (backslashes); normalise both sides to
+    # forward-slash lowercase before the prefix check (cygpath handles the drive form).
+    SYS_EXEC_N=$(cygpath -u "$SYS_EXEC" 2>/dev/null | tr 'A-Z' 'a-z')
+    SIDECAR_N=$(cygpath -u "$SIDECAR_DIR" 2>/dev/null | tr 'A-Z' 'a-z')
+else
+    SYS_EXEC_N="$SYS_EXEC"; SIDECAR_N="$SIDECAR_DIR"
+fi
+case "$SYS_EXEC_N" in
+    "$SIDECAR_N"/*)
         echo "    G3 PASS: sys.executable inside bundle: $SYS_EXEC"
         ;;
     *)
@@ -484,35 +667,47 @@ esac
 # dynamically from $SIDECAR_DIR/python-runtime).
 # Linux: minimal copy (~50 MB) for space-constrained builders (the Linux test VM UTM
 # may have <500 MB free before the resize). Mac: historical full copy (~400 MB).
-PORT_TEST_DIR="/tmp/nexe-sidecar-portable-test-$$"
+PORT_TEST_DIR="${TMPDIR:-/tmp}/nexe-sidecar-portable-test-$$"
 echo "==> G5 portability test (copy to $PORT_TEST_DIR)..."
 rm -rf "$PORT_TEST_DIR"
 mkdir -p "$PORT_TEST_DIR"
-case "$OS" in
-    Darwin)
+case "$OS_KIND" in
+    macos)
         cp -R "$SIDECAR_DIR/." "$PORT_TEST_DIR/"
         ;;
-    Linux)
+    linux)
         # Enough to validate that the copied Python boots + stdlib C ext OK.
         mkdir -p "$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv"
         cp -R "$SIDECAR_DIR/python-runtime/." "$PORT_TEST_DIR/python-runtime/"
         cp -R "$SIDECAR_DIR/venv/bin" "$PORT_TEST_DIR/venv/"
         ;;
+    windows)
+        # Copy only the PBS (python-runtime) — the portable boot interpreter. Its relative
+        # .pth to the venv finds nothing in this copy (no venv here), which is fine: G5
+        # validates PBS + stdlib portability; venv deps are covered by the smoke test.
+        mkdir -p "$PORT_TEST_DIR/python-runtime"
+        cp -R "$SIDECAR_DIR/python-runtime/." "$PORT_TEST_DIR/python-runtime/"
+        ;;
 esac
-if ! PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv/bin/python3" --version >/dev/null 2>&1; then
-    echo "    G5 FAIL: python3 from copied bundle does not run"
-    PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv/bin/python3" --version 2>&1 || true
+if [ "$OS_KIND" = windows ]; then
+    PORT_TEST_PY="$PORT_TEST_DIR/python-runtime/python.exe"
+else
+    PORT_TEST_PY="$PORT_TEST_DIR/venv/$VENV_PY_REL"
+fi
+if ! PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_PY" --version >/dev/null 2>&1; then
+    echo "    G5 FAIL: python from copied bundle does not run"
+    PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_PY" --version 2>&1 || true
     rm -rf "$PORT_TEST_DIR"
     exit 1
 fi
-if ! PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv/bin/python3" -c "import ssl, socket, hashlib" >/dev/null 2>&1; then
+if ! PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_PY" -c "import ssl, socket, hashlib" >/dev/null 2>&1; then
     echo "    G5 FAIL: stdlib C extensions not importable from copied bundle"
-    PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_DIR/venv/bin/python3" -c "import ssl, socket, hashlib" 2>&1 || true
+    PYTHONHOME="$PORT_TEST_DIR/python-runtime" "$PORT_TEST_PY" -c "import ssl, socket, hashlib" 2>&1 || true
     rm -rf "$PORT_TEST_DIR"
     exit 1
 fi
 rm -rf "$PORT_TEST_DIR"
-echo "    G5 PASS: copied bundle python3 works + stdlib C extensions OK"
+echo "    G5 PASS: copied bundle python works + stdlib C extensions OK"
 
 # G6: no builder home references in TEXT content of the bundle.
 # Tolerates matches in egg-info/RECORD (harmless metadata, no runtime impact).
@@ -520,11 +715,17 @@ echo "    G5 PASS: copied bundle python3 works + stdlib C extensions OK"
 # WSL and other custom homes. Mac: /Users/$BUILDER preserves the historical
 # behaviour (on macOS $HOME = /Users/$USER always, semantically equivalent).
 BUILDER=$(whoami)
-case "$OS" in
-    Darwin) BUILDER_HOME_PREFIX="/Users/$BUILDER" ;;
-    Linux)  BUILDER_HOME_PREFIX="$HOME" ;;
+case "$OS_KIND" in
+    macos)   BUILDER_HOME_PREFIX="/Users/$BUILDER" ;;
+    linux)   BUILDER_HOME_PREFIX="$HOME" ;;
+    windows) BUILDER_HOME_PREFIX="$HOME" ;;   # git-bash $HOME = /c/Users/<user>
+    *)       BUILDER_HOME_PREFIX="${HOME:-/nonexistent-home}" ;;
 esac
-GREP_HITS=$(grep -rI "$BUILDER_HOME_PREFIX" "$SIDECAR_DIR" 2>/dev/null | wc -l | tr -d ' ')
+# `|| true`: a non-matching grep returns 1, which under pipefail+set -e aborts the whole
+# build (silently, right after G5) — this fires on Windows where the bundle embeds native
+# C:\Users paths, not the unix $HOME (/c/Users). Also exclude the fastembed cache (~1.1 GB
+# of binary blobs) so the recursive grep stays fast.
+GREP_HITS=$( { grep -rI "$BUILDER_HOME_PREFIX" "$SIDECAR_DIR" --exclude-dir='.fastembed_cache' 2>/dev/null || true; } | wc -l | tr -d ' ')
 if [ "$GREP_HITS" -ne 0 ]; then
     echo "    G6 WARN: $GREP_HITS references to $BUILDER_HOME_PREFIX found (first 5):"
     # `|| true` neutralizes exit 141 (SIGPIPE) that fires when head -5 closes
@@ -545,12 +746,12 @@ find "$SIDECAR_DIR/venv" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/nu
 TRIMMED=$((TRIMMED + FOUND))
 
 # Remove pip/setuptools cache
-rm -rf "$SIDECAR_DIR/venv/lib/python${PY_VERSION}/site-packages/pip" 2>/dev/null
-rm -rf "$SIDECAR_DIR/venv/lib/python${PY_VERSION}/site-packages/setuptools" 2>/dev/null
+rm -rf "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL/pip" 2>/dev/null || true
+rm -rf "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL/setuptools" 2>/dev/null || true
 
 # Remove test directories inside site-packages
-find "$SIDECAR_DIR/venv/lib" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-find "$SIDECAR_DIR/venv/lib" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+find "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL" -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+find "$SIDECAR_DIR/venv/$SITE_PACKAGES_REL" -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
 
 # B135: remove venv activate scripts — they embed the builder's absolute
 # $VIRTUAL_ENV path (a plaintext home-dir leak that travels into the DMG).
@@ -558,7 +759,7 @@ find "$SIDECAR_DIR/venv/lib" -type d -name "test" -exec rm -rf {} + 2>/dev/null 
 # so dropping them is safe. A non-matching glob stays literal and `rm -f` returns 0
 # under set -euo pipefail. (Text-only mitigation: binaries still embed the path
 # via install-names/.pyc co_filename — see G6, which stays WARN by design.)
-rm -f "$SIDECAR_DIR"/venv/bin/activate*
+rm -f "$SIDECAR_DIR"/venv/"$VENV_BIN"/activate* "$SIDECAR_DIR"/venv/"$VENV_BIN"/Activate* "$SIDECAR_DIR"/venv/"$VENV_BIN"/deactivate* 2>/dev/null || true
 
 echo "    Trimmed $TRIMMED __pycache__ dirs + pip/setuptools/test dirs"
 
@@ -568,12 +769,19 @@ echo "    Trimmed $TRIMMED __pycache__ dirs + pip/setuptools/test dirs"
 # is set, it signs ~330 binaries (~1-3 min). Without an identity, it skips with a warning
 # (local dev build without a cert). The subsequent smoke test validates that the
 # signed binaries still import correctly.
-if [ "$OS" = "Darwin" ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+if [ "$OS_KIND" = macos ] && [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
     bash "$SCRIPT_DIR/sign-sidecar-binaries.sh" "$SIDECAR_DIR"
-elif [ "$OS" = "Darwin" ]; then
+elif [ "$OS_KIND" = macos ]; then
     echo "==> Sign step skipped (APPLE_SIGNING_IDENTITY unset — dev build)"
+elif [ "$OS_KIND" = windows ] && [ -n "${WINDOWS_SIGNING_CERT:-}" ]; then
+    # Authenticode signing of *.exe/*.dll/*.pyd via signtool (PowerShell). Gated by
+    # WINDOWS_SIGNING_CERT (thumbprint or /f path). Deferred by default (unsigned build).
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$SCRIPT_DIR/sign-sidecar-binaries.ps1" "$SIDECAR_DIR" \
+        || { echo "ERROR: Windows sidecar signing failed" >&2; exit 1; }
+elif [ "$OS_KIND" = windows ]; then
+    echo "==> Sign step skipped (WINDOWS_SIGNING_CERT unset — unsigned dev/validation build)"
 else
-    echo "==> Sign step skipped (Linux — codesign no aplica)"
+    echo "==> Sign step skipped ($OS_KIND — codesign no aplica)"
 fi
 
 # ── Step 6b: Copy launcher to src-tauri/binaries/ for Tauri externalBin ─
@@ -585,9 +793,20 @@ if [ -z "$HOST_TRIPLE" ]; then
 else
     BINARIES_DIR="$PROJECT_ROOT/src-tauri/binaries"
     mkdir -p "$BINARIES_DIR"
-    cp "$SIDECAR_DIR/nexe-sidecar" "$BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
-    chmod +x "$BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
-    echo "    Copied to: $BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
+    if [ "$OS_KIND" = windows ]; then
+        # Tauri requires the externalBin to carry the .exe suffix on Windows. The runtime
+        # NEVER executes it (it spawns python-runtime\python.exe from the extracted data-dir
+        # via build_windows_sidecar_command); it only needs to exist as a valid PE to satisfy
+        # Tauri's bundler + the resolve_sidecar_path_prod gate. Copy the bundled PBS
+        # python.exe (a real ARM64 PE) as an inert stub — avoids needing a Rust/MSVC linker.
+        STUB="$BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE.exe"
+        cp "$SIDECAR_DIR/python-runtime/python.exe" "$STUB"
+        echo "    Copied inert PE externalBin stub (bundled python.exe): $STUB"
+    else
+        cp "$SIDECAR_DIR/nexe-sidecar" "$BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
+        chmod +x "$BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
+        echo "    Copied to: $BINARIES_DIR/nexe-sidecar-$HOST_TRIPLE"
+    fi
 fi
 
 # ── Step 7: Validate ─────────────────────────────────────────────────
@@ -598,15 +817,15 @@ fi
 # "Fatal Python error: init_fs_encoding: failed... No module named 'encodings'".
 # The launcher (Step 5) always defines PYTHONHOME, just like the tests here.
 echo "==> Validating sidecar..."
-PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import fastapi; print(f'  FastAPI {fastapi.__version__}')"
-PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import uvicorn; print(f'  uvicorn {uvicorn.__version__}')"
+PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import fastapi; print(f'  FastAPI {fastapi.__version__}')"
+PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import uvicorn; print(f'  uvicorn {uvicorn.__version__}')"
 
 # Authenticated smoke test: generate a real UUID token + dynamic port so the
 # test mirrors the actual Tauri spawn contract (token via stdin, port via env).
 # An empty token would cause app.py to call os._exit(1) immediately.
 echo "==> Smoke test (boot + authenticated health check)..."
-SMOKE_TOKEN=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import uuid; print(uuid.uuid4())")
-SMOKE_PORT=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$VENV_PY" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); print(p)")
+SMOKE_TOKEN=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import uuid; print(uuid.uuid4())")
+SMOKE_PORT=$(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" -c "import socket; s=socket.socket(); s.bind(('127.0.0.1',0)); p=s.getsockname()[1]; s.close(); print(p)")
 # B137: PID-suffixed boot log (consistency with PORT_TEST_DIR which already uses $$).
 # Used in 4 places below INCLUDING the verify-encryption-gate.sh call (CRY-01) —
 # all must reference this var or the gate reads a stale/missing path.
@@ -629,20 +848,48 @@ fi
 # Env vars that Tauri (lib.rs spawn_sidecar_process) injects in production.
 # We replicate them here in the smoke test for consistency — without this, validate_production_security
 # (factory_security.py) raises ValueError before reaching uvicorn.
-echo "$SMOKE_TOKEN" | \
+if [ "$OS_KIND" = windows ]; then
+    # Windows: no bash launcher — spawn python.exe -m uvicorn directly (mirrors the
+    # runtime's build_windows_sidecar_command). Token via NEXE_TOKEN_INTERNAL env
+    # (Windows uvicorn does not read the stdin token). Ollama-only modules.
+    # MSYS $$ is NOT a valid Windows PID for OpenProcess — the parent watchdog would fail
+    # (err 87) and shut the server down mid-smoke. /proc/$$/winpid maps to the real Win PID
+    # of this bash (alive during the health poll), so the watchdog stays happy.
+    SMOKE_WINPID=$(cat /proc/$$/winpid 2>/dev/null || echo "$$")
+    PYTHONHOME="$SIDECAR_DIR/python-runtime" \
+    PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    NEXE_TOKEN_INTERNAL="$SMOKE_TOKEN" \
     NEXE_PORT="$SMOKE_PORT" \
     NEXE_SIDECAR=1 \
     NEXE_ENV=production \
     NEXE_PRIMARY_API_KEY="$SMOKE_TOKEN" \
-    NEXE_APPROVED_MODULES="security,memory,rag,embeddings,mlx_module,llama_cpp_module,ollama_module" \
+    NEXE_APPROVED_MODULES="security,memory,rag,embeddings,ollama_module" \
     NEXE_HOME="$SIDECAR_DIR/app" \
     NEXE_LOGS_DIR="$SIDECAR_DIR/logs" \
     NEXE_DATA_DIR="$SIDECAR_DIR/data" \
     NEXE_CACHE_DIR="$SIDECAR_DIR/cache" \
     NEXE_QDRANT_PATH="$SIDECAR_DIR/vectors" \
-    NEXE_PARENT_PID="$$" \
-    NEXE_TRAY_PID="$$" \
-    "$SIDECAR_DIR/nexe-sidecar" >"$SMOKE_BOOT_LOG" 2>&1 &
+    NEXE_PARENT_PID="$SMOKE_WINPID" \
+    NEXE_TRAY_PID="$SMOKE_WINPID" \
+    "$BOOT_PY" -m uvicorn core.app:app --host 127.0.0.1 --port "$SMOKE_PORT" \
+        --workers 1 --lifespan on --no-access-log --app-dir "$SIDECAR_DIR/app" \
+        >"$SMOKE_BOOT_LOG" 2>&1 &
+else
+    echo "$SMOKE_TOKEN" | \
+        NEXE_PORT="$SMOKE_PORT" \
+        NEXE_SIDECAR=1 \
+        NEXE_ENV=production \
+        NEXE_PRIMARY_API_KEY="$SMOKE_TOKEN" \
+        NEXE_APPROVED_MODULES="security,memory,rag,embeddings,mlx_module,llama_cpp_module,ollama_module" \
+        NEXE_HOME="$SIDECAR_DIR/app" \
+        NEXE_LOGS_DIR="$SIDECAR_DIR/logs" \
+        NEXE_DATA_DIR="$SIDECAR_DIR/data" \
+        NEXE_CACHE_DIR="$SIDECAR_DIR/cache" \
+        NEXE_QDRANT_PATH="$SIDECAR_DIR/vectors" \
+        NEXE_PARENT_PID="$$" \
+        NEXE_TRAY_PID="$$" \
+        "$SIDECAR_DIR/nexe-sidecar" >"$SMOKE_BOOT_LOG" 2>&1 &
+fi
 SIDECAR_PID=$!
 
 # Adapted polling — server-nexe takes 15-25s to become ready (memory + fastembed pre-warm).
@@ -718,7 +965,7 @@ echo "════════════════════════�
 echo ""
 echo "  Output:     $SIDECAR_DIR"
 echo "  Launcher:   $SIDECAR_DIR/nexe-sidecar"
-echo "  Python:     $("$VENV_PY" --version)"
+echo "  Python:     $(PYTHONHOME="$SIDECAR_DIR/python-runtime" "$BOOT_PY" --version 2>/dev/null)"
 echo "  Arch:       $(uname -m)"
 echo "  Bundle size:"
 du -sh "$SIDECAR_DIR/venv"
