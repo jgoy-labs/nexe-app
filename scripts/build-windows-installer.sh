@@ -6,7 +6,7 @@
 # builds there, and leaves the installer on the target for smoke-testing. Wipe the target and
 # re-run — nothing is lost, because the source of truth is here.
 #
-# This mirrors what /dmg-nexe-app does for macOS: same product (sidecar + Tauri), only the
+# This mirrors the macOS DMG build: same product (sidecar + Tauri), only the
 # compilation target differs. The one Windows-specific twist is that the build runs on a
 # remote ARM64 box (there is no cross-compiled functional sidecar — see release.yml B053).
 #

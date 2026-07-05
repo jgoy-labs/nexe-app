@@ -10,7 +10,7 @@
 
 One command on the **Mac** drives the whole build; the Windows box is a **disposable test
 target** (the tool and the source of truth live on the Mac — wipe the target and re-run,
-nothing is lost). This is the Windows sibling of `/dmg-nexe-app`: same product (sidecar +
+nothing is lost). This is the Windows sibling of the macOS DMG build: same product (sidecar +
 Tauri), only the compile target differs.
 
 ```bash

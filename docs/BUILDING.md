@@ -47,8 +47,8 @@ set at runtime by the Rust launcher (`src-tauri/src/lib.rs`) — belt and braces
 the build scripts. Reproducible-build path remapping + `SOURCE_DATE_EPOCH` for the public
 DMG (B141, `scripts/reproducible-build.sh`).
 
-An assisted, checklist-driven version of this path exists as an operator
-runbook outside the repo (`/dmg-nexe-app`); this section is the repo-resident
+An assisted, checklist-driven version of this path exists as an internal
+operator runbook outside the repo; this section is the repo-resident
 source of truth for the steps themselves.
 
 ## Linux — AppImage / deb
