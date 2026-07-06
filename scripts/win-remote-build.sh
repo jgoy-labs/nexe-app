@@ -58,6 +58,20 @@ grep -q "_install_ollama_windows" "$SRV_SRC/installer/installer_ollama_install.p
 #     src-tauri/sidecar-bundle.tar.gz. Skippable (reuse existing tarball) for fast tauri iteration.
 cd "$APP_SRC"
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+# git-bash -lc puts /usr/bin FIRST, whose link.exe is the coreutils `link` (a
+# hardlink tool), NOT the MSVC linker — cargo's link step then fails on every
+# build script. Put the MSVC arm64 bin dir in front for the WHOLE build. This
+# also bites the SIDECAR build: fastembed's py-rust-stemmers is a native wheel
+# that compiles via cargo, so a cold uv cache (e.g. after a disk cleanup) forces
+# a from-source build here — previously only the tauri step (below) was guarded.
+MSVC_LINK=$(find "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC" \
+  -ipath "*/bin/Hostarm64/arm64/link.exe" 2>/dev/null | sort -V | tail -1)
+[[ -n "$MSVC_LINK" ]] || { echo "FATAL: MSVC arm64 link.exe not found (VS BuildTools + arm64 component?)"; exit 7; }
+export PATH="$(dirname "$MSVC_LINK"):$PATH"
+echo "link.exe -> $(command -v link.exe)"
+case "$(command -v link.exe)" in /usr/bin/*|/bin/*) echo "FATAL: link.exe still coreutils, not MSVC"; exit 7 ;; esac
+
 if [[ -n "$SKIP_SIDECAR" && -f src-tauri/sidecar-bundle.tar.gz ]]; then
   log "SKIP_SIDECAR: reusing existing src-tauri/sidecar-bundle.tar.gz"
 else
@@ -87,16 +101,10 @@ log "pnpm install (tauri CLI + rolldown arm64 binding)"
 command -v pnpm >/dev/null 2>&1 || { echo "FATAL: pnpm not on PATH"; exit 6; }
 pnpm install --frozen-lockfile
 
-# --- 7. Build the NSIS installer. git-bash -lc puts /usr/bin FIRST, whose link.exe is the
-#     coreutils `link` (a hardlink tool), NOT the MSVC linker — cargo's link step then fails
-#     on every build script. Put the MSVC arm64 bin dir (host arm64 → target arm64) in front.
+# --- 7. Build the NSIS installer. The MSVC arm64 linker was already put in front
+#     of PATH above (before the sidecar build), so cargo's link step here uses it
+#     instead of git-bash's coreutils /usr/bin/link.exe.
 log "tauri build --bundles nsis"
-MSVC_LINK=$(find "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC" \
-  -ipath "*/bin/Hostarm64/arm64/link.exe" 2>/dev/null | sort -V | tail -1)
-[[ -n "$MSVC_LINK" ]] || { echo "FATAL: MSVC arm64 link.exe not found (VS BuildTools + arm64 component?)"; exit 7; }
-export PATH="$(dirname "$MSVC_LINK"):$PATH"
-echo "link.exe -> $(command -v link.exe)"
-case "$(command -v link.exe)" in /usr/bin/*|/bin/*) echo "FATAL: link.exe still coreutils, not MSVC"; exit 7 ;; esac
 pnpm tauri build --bundles nsis
 
 # --- 7. Report the installer artifact.

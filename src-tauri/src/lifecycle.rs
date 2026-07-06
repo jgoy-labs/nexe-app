@@ -283,8 +283,13 @@ pub(crate) fn kill_sidecar_child(mutex: &Mutex<Option<std::process::Child>>) -> 
         // logged and we still fall through to child.kill()+wait() below.
         #[cfg(windows)]
         {
+            // CREATE_NO_WINDOW so the tree-kill does not flash a console window
+            // in GUI mode (mirrors build_windows_sidecar_command in lib.rs).
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             match std::process::Command::new("taskkill")
                 .args(["/T", "/F", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
                 .output()
             {
                 Ok(out) => tracing::info!(
