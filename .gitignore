@@ -50,9 +50,6 @@ src-tauri/sidecar-bundle.tar.gz
 # (sidecar.rs) per detectar re-builds dins la mateixa CARGO_PKG_VERSION.
 src-tauri/sidecar-bundle.sha256
 
-# Internal audit artifacts (DEV-only, not for OSS)
-.muthur/
-
 # Python (si s'afegeix sidecar amb venv local)
 __pycache__/
 *.pyc

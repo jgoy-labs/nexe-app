@@ -296,7 +296,7 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         # GNU/bsdtar; explicit copy+prune is predictable). verify-privacy-gate.sh is the net.
         cp -R "$APP_SOURCE_DIR/." "$SIDECAR_DIR/app/"
         ( cd "$SIDECAR_DIR/app" && rm -rf \
-            storage .env .git diari tests InstallNexe.app Nexe.app .muthur dev-tools \
+            storage .env .git diari tests InstallNexe.app Nexe.app .internal-audit dev-tools \
             .test_venv .venv .test_data worktrees .github .grimp_cache .ruff_cache \
             node_modules .pytest_cache .mypy_cache .coverage docs specialists scripts \
             SetupNexe.command setup.sh nexe eslint.config.js package.json package-lock.json \
@@ -322,7 +322,7 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         --exclude='/storage' --exclude='.env' --exclude='/.git' \
         --exclude='__pycache__' --exclude='/venv' --exclude='/diari' \
         --exclude='/tests' --exclude='/InstallNexe.app' --exclude='/Nexe.app' \
-        --exclude='/.muthur' --exclude='/dev-tools' \
+        --exclude='/.internal-audit' --exclude='/dev-tools' \
         --exclude='/.test_venv' --exclude='/.venv' \
         --exclude='/.test_data' --exclude='/worktrees' \
         --exclude='/.github' --exclude='/.grimp_cache' --exclude='/.ruff_cache' \
