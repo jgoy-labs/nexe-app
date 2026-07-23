@@ -400,6 +400,32 @@ describe("step2 — inferFlags (name → capability flags)", () => {
   });
 });
 
+// 840 (NEXE-8GB-MLX-SELECTION), superseded 2026-07-23 (D-B): MLX is the
+// default on EVERY Mac with Metal, including 8 GB. The 18/07 RAM-aware
+// default existed because the strict guard made MLX a dead-end on 8 GB; the
+// field measurement showed MLX works there and the guard now warns instead
+// of refusing. Product decision by Jordi — these pins are the mutation
+// control against re-introducing the RAM special-case.
+describe("step2-hardware — _defaultBackend (MLX default on Metal, D-B)", () => {
+  it("defaults to MLX (backends[0]) on 8 GB machines too", async () => {
+    const { _defaultBackend } = await import("./step2-hardware.js?t=" + Date.now() + 50);
+    expect(_defaultBackend(["MLX", "Ollama"], 8)).toBe("MLX");
+    expect(_defaultBackend(["MLX", "Ollama"], 4)).toBe("MLX");
+  });
+
+  it("keeps MLX (backends[0]) as the default on >8 GB machines", async () => {
+    const { _defaultBackend } = await import("./step2-hardware.js?t=" + Date.now() + 51);
+    expect(_defaultBackend(["MLX", "Ollama"], 16)).toBe("MLX");
+    expect(_defaultBackend(["MLX", "Ollama"], 32)).toBe("MLX");
+  });
+
+  it("falls back to the first backend when RAM is unknown or MLX absent", async () => {
+    const { _defaultBackend } = await import("./step2-hardware.js?t=" + Date.now() + 52);
+    expect(_defaultBackend(["MLX", "Ollama"], undefined)).toBe("MLX");
+    expect(_defaultBackend(["Ollama"], 8)).toBe("Ollama"); // no MLX build
+  });
+});
+
 // ---------------------------------------------------------------------------
 // step3-download — stall controller + SSE frame handler (extracted from
 // _streamDownload during a complexity refactor).

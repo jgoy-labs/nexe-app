@@ -93,6 +93,83 @@ impl Drop for RestartGuard {
     }
 }
 
+// ─── Runtime supervisor (WSH-001) ─────────────────────────────────────────────
+
+/// How often the supervisor probes the sidecar's liveness.
+pub(crate) const SUPERVISOR_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// Consecutive HTTP health-check failures before a STILL-RUNNING sidecar is
+/// treated as dead (covers a hung/unresponsive process, not just a crashed one).
+/// A definite process exit (`try_wait` → `Some`) short-circuits this threshold.
+pub(crate) const HB_FAIL_THRESHOLD: u32 = 3;
+
+/// Health-wait budget for a supervisor respawn (seconds). Generous on purpose: a
+/// warm respawn usually boots in a few seconds, but a system under load can be
+/// slower — the wait must outlast a legitimate boot so the supervisor does not
+/// tight-loop-kill a respawn that is still coming up. A respawn that never turns
+/// healthy within this budget is treated as failed and retried with backoff.
+pub(crate) const RESPAWN_HEALTH_TIMEOUT_SECS: u64 = 60;
+
+/// Restart backoff schedule. Grows to a ceiling and then STAYS there: the
+/// supervisor never gives up permanently — a sidecar that only recovers after a
+/// transient spike (or a port freeing up) is respawned on a later attempt.
+/// Modeled on server-nexe's `_LOCK_RETRY_BACKOFF_S` tuple (fixed schedule, cap =
+/// last element).
+pub(crate) const RESTART_BACKOFF: [std::time::Duration; 8] = [
+    std::time::Duration::from_secs(0),
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(16),
+    std::time::Duration::from_secs(30),
+    std::time::Duration::from_secs(60),
+];
+
+/// Delay before restart attempt `attempt` (0-based). Saturates at the last
+/// element so the caller can loop forever at the ceiling without ever giving up.
+pub(crate) fn supervisor_backoff(attempt: u32) -> std::time::Duration {
+    let idx = (attempt as usize).min(RESTART_BACKOFF.len() - 1);
+    RESTART_BACKOFF[idx]
+}
+
+/// Pure restart decision (unit-testable without spawning a process or hitting
+/// the network). The supervisor respawns the sidecar ONLY when it is dead AND
+/// the app is neither shutting down nor already restarting — the truth table
+/// that encodes guards R1–R4.
+pub(crate) fn should_restart(dead: bool, shutting_down: bool, restart_in_progress: bool) -> bool {
+    dead && !shutting_down && !restart_in_progress
+}
+
+/// Whether the supervisor should treat the sidecar as dead. A definite process
+/// exit (`proc_dead`) always counts. A hang (consecutive HTTP failures,
+/// `hb_fails`) counts ONLY once the app has been healthy at least once in its
+/// lifetime (`ever_healthy`) — this defers the very first boot to
+/// `poll_sidecar_health`'s 120s budget so the supervisor never murders a
+/// still-booting sidecar. `ever_healthy` is a LIFETIME latch (never reset): once
+/// the app has served the UI, the supervisor stays armed forever, so a hung or
+/// failed respawn generation is still detected and retried (it must NOT go blind
+/// after a respawn — that would break the "never gives up" contract).
+pub(crate) fn sidecar_dead(proc_dead: bool, ever_healthy: bool, hb_fails: u32) -> bool {
+    proc_dead || (ever_healthy && hb_fails >= HB_FAIL_THRESHOLD)
+}
+
+/// Non-consuming liveness check for the supervisor: `true` if the child has
+/// exited, `false` if it is still running or the slot is empty. Locks with
+/// poison recovery (R6) and calls `try_wait` via `as_mut()` — NEVER `take()`
+/// (R5) — so it does not disturb `kill_sidecar_child`'s idempotency. Reaps a
+/// zombie as a side effect of `try_wait` (avoids accumulation). A `None` slot
+/// means the lifecycle (kill/restart) owns it → reported as "not exited" so the
+/// supervisor leaves it alone.
+pub(crate) fn child_has_exited(slot: &Mutex<Option<Child>>) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_mut() {
+        Some(child) => matches!(child.try_wait(), Ok(Some(_))),
+        None => false,
+    }
+}
+
 /// Reserve an ephemeral port on 127.0.0.1 and return its number.
 ///
 /// Binds `127.0.0.1:0` (OS assigns a free port), reads the assigned port,
@@ -461,5 +538,132 @@ mod tests {
             unique >= 95,
             "expected ≥95 unique ports out of 100, got {unique}"
         );
+    }
+
+    // ─── Supervisor: backoff + decision (WSH-001) ───────────────────
+
+    /// `supervisor_backoff` saturates at the ceiling and NEVER panics — the
+    /// supervisor relies on this to retry forever without giving up (external review
+    /// BLOCKER 3).
+    #[test]
+    fn supervisor_backoff_saturates_at_ceiling() {
+        assert_eq!(supervisor_backoff(0), std::time::Duration::from_secs(0));
+        let last_idx = RESTART_BACKOFF.len() as u32 - 1;
+        let ceiling = RESTART_BACKOFF[RESTART_BACKOFF.len() - 1];
+        assert_eq!(supervisor_backoff(last_idx), ceiling);
+        // Way past the end: stays at the ceiling, no out-of-bounds panic.
+        assert_eq!(supervisor_backoff(9_999), ceiling);
+    }
+
+    /// `should_restart` truth table (guards R1–R4): respawn ONLY when the sidecar
+    /// is dead AND neither shutting down nor already restarting.
+    #[test]
+    fn should_restart_only_when_dead_and_unguarded() {
+        assert!(should_restart(true, false, false), "dead + no guards → restart");
+        assert!(!should_restart(false, false, false), "alive → never restart");
+        assert!(!should_restart(true, true, false), "shutting down → never restart");
+        assert!(
+            !should_restart(true, false, true),
+            "restart in progress → never restart"
+        );
+        assert!(!should_restart(false, true, true), "alive + guards → never restart");
+    }
+
+    /// `sidecar_dead`: a crash always counts; a hang counts ONLY after the sidecar
+    /// has been healthy once — the boot-grace that prevents killing a slow booter
+    /// (Review HIGH regression guard).
+    #[test]
+    fn sidecar_dead_respects_boot_grace() {
+        // Booting (never healthy) + many HTTP fails → NOT dead (grace).
+        assert!(
+            !sidecar_dead(false, false, 99),
+            "a hang before the first healthy reply must NOT count as dead"
+        );
+        // Healthy once, then hangs past the threshold → dead.
+        assert!(
+            sidecar_dead(false, true, HB_FAIL_THRESHOLD),
+            "a hang after being healthy → dead"
+        );
+        assert!(
+            !sidecar_dead(false, true, HB_FAIL_THRESHOLD - 1),
+            "below the hang threshold → not dead"
+        );
+        // A definite process exit always counts, even during boot.
+        assert!(
+            sidecar_dead(true, false, 0),
+            "a process crash → dead regardless of the boot grace"
+        );
+    }
+
+    /// `verify_port_free` (previously untested): a bound listening port is
+    /// reported in-use; a released ephemeral port is reported free. Guards the
+    /// supervisor's pre-spawn check.
+    #[test]
+    fn verify_port_free_detects_bound_and_free() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let bound = listener.local_addr().expect("local_addr").port();
+        assert!(
+            verify_port_free(bound).is_err(),
+            "a bound+listening port must be reported in-use"
+        );
+        drop(listener);
+        // A freshly reserved-then-released port has nothing listening → free.
+        let free = reserve_ephemeral_port().expect("reserve must succeed");
+        assert!(
+            verify_port_free(free).is_ok(),
+            "an unbound port must be reported free"
+        );
+    }
+
+    /// `child_has_exited` with REAL subprocesses: a long-lived child is not
+    /// exited; a short-lived child is reported exited once it finishes. Mirrors
+    /// the try_wait poll neighbor in `win_job.rs`.
+    #[test]
+    fn child_has_exited_detects_alive_and_dead() {
+        // Alive: a 60s sleeper must NOT be reported exited.
+        #[cfg(windows)]
+        let alive = std::process::Command::new("cmd")
+            .args(["/c", "ping -n 60 127.0.0.1 >nul"])
+            .spawn()
+            .expect("spawn sleeper");
+        #[cfg(not(windows))]
+        let alive = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleeper");
+        let alive_slot = Mutex::new(Some(alive));
+        assert!(
+            !child_has_exited(&alive_slot),
+            "a running child must not be reported exited"
+        );
+        crate::lifecycle::kill_sidecar_child(&alive_slot); // cleanup
+
+        // Dead: a child that exits immediately IS reported exited (poll until the
+        // OS has reaped it, deadline ~2s — same shape as win_job.rs try_wait loop).
+        #[cfg(windows)]
+        let dead = std::process::Command::new("cmd")
+            .args(["/c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived");
+        #[cfg(not(windows))]
+        let dead = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn short-lived");
+        let dead_slot = Mutex::new(Some(dead));
+        let mut exited = false;
+        for _ in 0..100 {
+            if child_has_exited(&dead_slot) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            exited,
+            "a short-lived child must be reported exited within ~2s"
+        );
+        // `None`-slot short-circuit: lifecycle owns it → never "exited".
+        let empty: Mutex<Option<std::process::Child>> = Mutex::new(None);
+        assert!(!child_has_exited(&empty), "empty slot must report not-exited");
     }
 }

@@ -34,7 +34,37 @@ use catalog::fetch_catalog;
 use hardware::get_hardware;
 use onboarding_cmd::{
     check_first_run, check_partial_install, mark_onboarding_complete, reset_installation,
+    uninstall_with_options,
 };
+
+/// Host allowlist for [`open_external_url`]. Only origins the app legitimately
+/// links to reach the system browser; everything else is rejected. A host
+/// matches when it equals an apex exactly OR is a subdomain of it.
+const EXTERNAL_URL_ALLOWED_HOSTS: &[&str] = &["server-nexe.com", "huggingface.co"];
+
+/// Validate an external URL before dispatching it to the OS browser handler.
+///
+/// WSA-004 / WSD-003 / WSE-002: parse with `url::Url::parse` (scheme + host),
+/// NOT a `starts_with("http")` prefix. A prefix check accepts any origin
+/// (`https://evil.example/phish`), letting the webview drive the system browser
+/// to an attacker-chosen page (CWE-601 phishing). Here the scheme must be
+/// `http`/`https` AND the host must be on [`EXTERNAL_URL_ALLOWED_HOSTS`].
+fn is_allowed_external_url(url: &str) -> bool {
+    let parsed = match url::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false; // opaque / hostless URL — reject
+    };
+    let host = host.to_ascii_lowercase();
+    EXTERNAL_URL_ALLOWED_HOSTS
+        .iter()
+        .any(|apex| host == *apex || host.ends_with(&format!(".{apex}")))
+}
 
 /// Open an external http/https URL in the system default browser.
 ///
@@ -42,12 +72,13 @@ use onboarding_cmd::{
 /// by default. This command calls the OS handler (`open` on macOS, `xdg-open`
 /// on Linux) so the system browser receives the URL instead of the webview.
 ///
-/// Only `https://` and `http://` schemes are accepted — all others are
-/// silently rejected to prevent scheme-injection attacks.
+/// Only allowlisted http/https origins are accepted (see
+/// [`is_allowed_external_url`]) — every other scheme or host is rejected and
+/// logged, closing the arbitrary-origin navigation / phishing gap.
 #[tauri::command]
 fn open_external_url(url: String) {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        tracing::warn!(url, "open_external_url: rejected non-http scheme");
+    if !is_allowed_external_url(&url) {
+        tracing::warn!(url, "open_external_url: rejected (scheme/host not allowed)");
         return;
     }
     #[cfg(target_os = "macos")]
@@ -86,7 +117,7 @@ use crate::handler::{
     try_acquire_pending_slot, MAX_QUEUED, PENDING_COUNT,
 };
 use crate::lifecycle::{graceful_quit, quit_app, EXIT_CONFIRMED};
-use crate::rate_limit::rate_limit_ok_for;
+use crate::rate_limit::plugin_rate_limits_ok;
 use crate::sidecar::{
     reserve_ephemeral_port, resolve_sidecar_path, restart_try_acquire, verify_port_free,
     RestartGuard, SidecarLogPath, SpawnContext,
@@ -222,13 +253,31 @@ fn seed_fastembed_cache(sidecar_dir: &Path) {
     };
     let src = sidecar_dir.join("app").join(".fastembed_cache");
     let dst_root = home.join(".cache").join("fastembed");
-    let marker =
-        dst_root.join("models--sentence-transformers--paraphrase-multilingual-mpnet-base-v2");
-    if !src.is_dir() || marker.exists() {
+    // The marker used to be `models--sentence-transformers--<model>`, but
+    // fastembed materialises the cache under `models--xenova--<model>` (the
+    // ONNX mirror it downloads from). That path never existed, so "first
+    // launch" was true on every launch and this re-copied ~1 GB each time.
+    //
+    // The sentinel carries the IDENTITY of what was seeded, not just the fact
+    // that something was: a bare existence check would make the seed a one-shot
+    // for the life of the machine, so a later build shipping a different
+    // embedder would never install it and the user would silently keep the old
+    // one. Kept in lockstep with the POSIX launcher's guard in build-sidecar.sh.
+    let sentinel = dst_root.join(".nexe-seeded");
+    if !src.is_dir() {
+        return;
+    }
+    let want_id = std::fs::read_to_string(src.join(".nexe-embedder-id"))
+        .unwrap_or_else(|_| "unknown".into());
+    let have_id = std::fs::read_to_string(&sentinel).unwrap_or_default();
+    if want_id.trim() == have_id.trim() && !have_id.trim().is_empty() {
         return;
     }
     match copy_dir_recursive(&src, &dst_root) {
-        Ok(()) => tracing::info!("first launch: fastembed cache seeded to user cache"),
+        Ok(()) => {
+            let _ = std::fs::write(&sentinel, want_id.trim().as_bytes());
+            tracing::info!(id = %want_id.trim(), "fastembed cache seeded to user cache");
+        }
         Err(e) => {
             tracing::warn!(error = %e, "fastembed cache seed failed (will download at first chat)")
         }
@@ -606,6 +655,35 @@ fn spawn_sidecar_process(
 /// up and navigates while the sidecar is still legitimately booting (B169).
 pub(crate) const HEALTH_POLL_TIMEOUT_SECS: u64 = 120;
 
+/// What `poll_sidecar_health` must do once the poll loop finishes (WSH-005).
+///
+/// Extracted as a pure decision so the timeout/no-navigate rule is unit
+/// testable without a running webview.
+#[derive(Debug, PartialEq, Eq)]
+enum PostPollAction {
+    /// Sidecar healthy, normal run → navigate the webview to the UI.
+    Navigate,
+    /// Sidecar healthy but first run → the onboarding wizard owns the screen
+    /// and navigates itself; do nothing.
+    DeferToWizard,
+    /// Timeout on a normal run → do NOT navigate (the old "navigating anyway"
+    /// path landed the user on a connection-refused page). Stay on the splash
+    /// and emit `sidecar-timeout` so the splash JS shows the error + retry.
+    StayAndNotify,
+    /// Timeout during first run → the wizard is visible and the sidecar may
+    /// legitimately not be configured yet; stay quiet, no event.
+    StayQuiet,
+}
+
+fn post_poll_action(ready: bool, first_run: bool) -> PostPollAction {
+    match (ready, first_run) {
+        (true, false) => PostPollAction::Navigate,
+        (true, true) => PostPollAction::DeferToWizard,
+        (false, false) => PostPollAction::StayAndNotify,
+        (false, true) => PostPollAction::StayQuiet,
+    }
+}
+
 /// Poll sidecar health endpoint and navigate to web UI when ready.
 ///
 /// After reverting to the sidecar-served UI, the sidecar serves the full UI again, so we navigate
@@ -627,10 +705,14 @@ async fn poll_sidecar_health(
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(HEALTH_POLL_TIMEOUT_SECS);
     let mut elapsed = 0u32;
+    // WSH-005: `ready` distinguishes success from timeout. The old code used
+    // the same `break` for both and then navigated "anyway" — on timeout that
+    // replaced the splash with a connection-refused page.
+    let mut ready = false;
     loop {
         if std::time::Instant::now() > deadline {
             tracing::warn!(
-                "splash: sidecar health timeout after {HEALTH_POLL_TIMEOUT_SECS}s — navigating anyway"
+                "splash: sidecar health timeout after {HEALTH_POLL_TIMEOUT_SECS}s — staying on splash (WSH-005)"
             );
             break;
         }
@@ -643,6 +725,7 @@ async fn poll_sidecar_health(
         {
             Ok(r) if r.status().is_success() => {
                 tracing::info!(port, elapsed_s = elapsed / 2, "splash: sidecar ready");
+                ready = true;
                 break;
             }
             _ => {
@@ -659,13 +742,45 @@ async fn poll_sidecar_health(
     // will navigate to the main UI itself (the api_key arrives via the
     // /installer/finalize response, no separate Tauri command needed).
     // Skip auto-navigation so the health-poll does not clobber the wizard mid-flow.
-    let first_run = !crate::onboarding_cmd::flag_path(&app_handle).exists();
-    if first_run {
-        tracing::info!(
-            port,
-            "sidecar ready (first-run) — deferring navigation to onboarding wizard"
-        );
-        return;
+    // Finding B: share the SAME two-store, self-healing definition as
+    // `check_first_run` (flag OR sidecar onboarding.json) so the poll and the
+    // frontend never disagree about whether this is a first run — the old
+    // flag-only check said "first run" even when the sidecar had finalized,
+    // deferring navigation to a wizard that had already handed off.
+    let first_run = !crate::onboarding_cmd::is_onboarding_complete(&app_handle);
+    match post_poll_action(ready, first_run) {
+        PostPollAction::Navigate => {} // fall through to the navigation below
+        PostPollAction::DeferToWizard => {
+            tracing::info!(
+                port,
+                "sidecar ready (first-run) — deferring navigation to onboarding wizard"
+            );
+            return;
+        }
+        PostPollAction::StayAndNotify => {
+            // Tell the splash JS to show its error + retry button now.
+            // Timeout coherence: this fires at HEALTH_POLL_TIMEOUT_SECS (120s)
+            // and the splash's own fallback timer (main.js HEALTH_TIMEOUT_MS =
+            // 120_000 ms) starts at DOMContentLoaded — i.e. never earlier than
+            // this task — so even if the event were lost the JS still surfaces
+            // its own timeout error; the event just makes it immediate and
+            // adds the retry affordance.
+            use tauri::Emitter;
+            if let Some(w) = app_handle.get_webview_window("main") {
+                match w.emit("sidecar-timeout", HEALTH_POLL_TIMEOUT_SECS) {
+                    Ok(()) => tracing::info!(port, "splash: emitted sidecar-timeout to splash JS"),
+                    Err(e) => tracing::error!(error = %e, port, "splash: emit sidecar-timeout failed"),
+                }
+            }
+            return;
+        }
+        PostPollAction::StayQuiet => {
+            tracing::warn!(
+                port,
+                "sidecar not healthy after budget during first run — leaving the wizard in charge"
+            );
+            return;
+        }
     }
 
     if let Some(w) = app_handle.get_webview_window("main") {
@@ -851,15 +966,23 @@ async fn spawn_and_register_child(ctx: &RestartCtx<'_>, new_port: u16) -> Result
     Ok(new_pid)
 }
 
-/// Poll `/admin/system/health` up to 30s (500ms interval) until it returns 2xx.
-/// Returns `true` when the new sidecar is healthy, `false` on timeout.
+/// Poll `/admin/system/health` (500ms interval) up to `deadline_secs` until it
+/// returns 2xx. Returns `true` when the sidecar is healthy, `false` on timeout.
+/// The supervisor passes a generous boot budget so a slow-booting respawn is not
+/// tight-loop-killed; the manual restart command passes the shorter 30s.
 async fn wait_for_sidecar_health(
     http_client: &reqwest::Client,
     health_url: &str,
     bearer: &str,
+    deadline_secs: u64,
 ) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(deadline_secs);
     while std::time::Instant::now() < deadline {
+        // Bail promptly if the app started shutting down — never keep a doomed
+        // (up to 60s) respawn health-wait alive during a quit/uninstall.
+        if crate::lifecycle::is_shutting_down() {
+            return false;
+        }
         match http_client
             .get(health_url)
             .header("Authorization", bearer)
@@ -933,7 +1056,7 @@ async fn restart_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
 
     let health_url = format!("http://127.0.0.1:{new_port}/admin/system/health");
     let bearer = format!("Bearer {}", ctx.auth_token);
-    if !wait_for_sidecar_health(&ctx.http_client, &health_url, &bearer).await {
+    if !wait_for_sidecar_health(&ctx.http_client, &health_url, &bearer, 30).await {
         // Revert port to the old value. The new sidecar is dead and
         // the old one was already killed, so neither is serving. Reverting
         // gives the frontend a clear "connection refused" on old_port rather
@@ -953,6 +1076,263 @@ async fn restart_sidecar(app: tauri::AppHandle) -> Result<u16, String> {
     let _ = app.emit("sidecar-restarted", new_port);
 
     Ok(new_port)
+}
+
+/// Same-port respawn used by the runtime supervisor (WSH-001). Unlike the manual
+/// `restart_sidecar` command it (a) reuses the CURRENT port instead of reserving
+/// a new one — so the plugin UI reconnects on its own `/status` poll with no
+/// re-navigation (impossible cleanly on WebView2), and (b) does not emit
+/// `sidecar-restarted` (the http-origin UI never receives Tauri events anyway).
+/// `kill_sidecar_child` is idempotent: a crashed child is already dead (fast
+/// path), a hung one is SIGKILLed and its port freed. The auth token is reused
+/// so the UI's session stays valid across the respawn.
+async fn respawn_same_port(app: tauri::AppHandle) -> Result<(), String> {
+    // R4 / external review ALT 1: never respawn while the app is closing/uninstalling.
+    if crate::lifecycle::is_shutting_down() {
+        return Err("shutdown in progress — skipping respawn".to_string());
+    }
+    let ctx = lookup_restart_state(&app)?;
+    let port = ctx.port_state.get();
+    // Reap the dead child, or kill a hung one — frees the port either way.
+    let _ = crate::lifecycle::kill_sidecar_child(&ctx.child_state.0);
+    verify_port_free(port).map_err(|e| format!("respawn_same_port verify {port}: {e}"))?;
+    // R4 / external review ALT 1: final shutdown check right before the spawn — the kill
+    // above can take up to 1.5s, and a quit may have begun in that window; never
+    // spawn a fresh sidecar the shutdown path is about to (or already did) kill.
+    if crate::lifecycle::is_shutting_down() {
+        return Err("shutdown began during respawn — aborting before spawn".to_string());
+    }
+    let new_pid = spawn_and_register_child(&ctx, port).await?;
+    // Review HIGH: a shutdown can begin DURING the spawn. The shutdown path
+    // (quit/uninstall) kills the sidecar exactly once by reading the SidecarChild
+    // slot — which was `None` while we were spawning — so its kill misses this
+    // fresh child. The child runs in its own process group, so `app.exit(0)` will
+    // NOT reap it → it would orphan (corrupting an uninstall wipe / holding the
+    // port). Close the window: if a shutdown started, kill the child we just
+    // registered before it can leak.
+    if crate::lifecycle::is_shutting_down() {
+        let _ = crate::lifecycle::kill_sidecar_child(&ctx.child_state.0);
+        return Err("shutdown began during respawn — killed the fresh sidecar".to_string());
+    }
+    let health_url = format!("http://127.0.0.1:{port}/admin/system/health");
+    let bearer = format!("Bearer {}", ctx.auth_token);
+    if !wait_for_sidecar_health(
+        &ctx.http_client,
+        &health_url,
+        &bearer,
+        crate::sidecar::RESPAWN_HEALTH_TIMEOUT_SECS,
+    )
+    .await
+    {
+        // If a shutdown began during the wait (health-wait bailed early), the
+        // fresh child is registered and alive — kill it now so it cannot linger
+        // touching storage during an uninstall wipe (Round-3 LOW: full_uninstall
+        // races a booting sidecar).
+        if crate::lifecycle::is_shutting_down() {
+            let _ = crate::lifecycle::kill_sidecar_child(&ctx.child_state.0);
+        }
+        return Err(format!(
+            "respawn_same_port: sidecar on {port} not healthy within {}s",
+            crate::sidecar::RESPAWN_HEALTH_TIMEOUT_SECS
+        ));
+    }
+    tracing::info!(new_pid, port, "supervisor: sidecar respawned on same port, healthy");
+    Ok(())
+}
+
+/// One-shot liveness probe used to CONFIRM the sidecar is genuinely down right
+/// before the supervisor kills+respawns it. Between deciding "dead" and acting,
+/// the supervisor sleeps a backoff without holding the restart guard, so the
+/// sidecar may have recovered (self-heal, or a manual/onboarding restart that
+/// finished). Returns true if it now looks HEALTHY (process alive AND health
+/// endpoint 2xx) — in which case the supervisor must NOT kill it.
+async fn supervisor_sidecar_healthy(app: &tauri::AppHandle) -> bool {
+    let (port, client, token) = {
+        let ctx = match lookup_restart_state(app) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+        if crate::sidecar::child_has_exited(&ctx.child_state.0) {
+            return false; // process gone → not healthy
+        }
+        (
+            ctx.port_state.get(),
+            ctx.http_client.clone(),
+            ctx.auth_token.clone(),
+        )
+    };
+    let url = format!("http://127.0.0.1:{port}/admin/system/health");
+    // A single loopback probe can transiently fail (the sidecar momentarily busy
+    // on its event loop); a false negative here would kill a HEALTHY sidecar that
+    // just recovered during the backoff. Require 3 consecutive misses before
+    // concluding "down" — healthy if ANY probe succeeds (Review MEDIUM).
+    for probe in 0..3u8 {
+        if probe > 0 {
+            let _ = tauri::async_runtime::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(200))
+            })
+            .await;
+        }
+        if matches!(
+            client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .timeout(std::time::Duration::from_millis(500))
+                .send()
+                .await,
+            Ok(resp) if resp.status().is_success()
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Runtime supervisor (WSH-001): watches the sidecar and respawns it on the same
+/// port if it dies (process exit) or hangs (`HB_FAIL_THRESHOLD` consecutive HTTP
+/// health failures), with a backoff that NEVER gives up permanently. Idle while
+/// the app is shutting down or a manual restart is in flight. Spawned once at
+/// `setup_services`; runs until `app.exit(0)`.
+async fn sidecar_supervisor(app: tauri::AppHandle) {
+    let mut hb_fails: u32 = 0;
+    let mut attempt: u32 = 0;
+    // Has the app EVER been healthy in its lifetime? LATCH — set once, never
+    // reset. Hang-detection (hb_fails) must not fire before this, so the very
+    // first boot is deferred to poll_sidecar_health's 120s budget and a booting
+    // sidecar is never murdered. But it must NOT go back to false after a
+    // respawn: a hung/failed respawn generation still has to be detected and
+    // retried, or the supervisor goes permanently blind (Round-2 HIGH). A
+    // still-booting *respawn* is instead protected by respawn_same_port's
+    // generous health-wait (RESPAWN_HEALTH_TIMEOUT_SECS), not by this latch. A
+    // definite process crash always restarts regardless of the latch.
+    let mut ever_healthy = false;
+
+    loop {
+        // Interval sleep off the async reactor (tokio is not a direct dep).
+        let interval = crate::sidecar::SUPERVISOR_POLL_INTERVAL;
+        let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(interval)).await;
+
+        if crate::lifecycle::is_shutting_down() {
+            tracing::info!("supervisor: shutdown detected — stopping");
+            return;
+        }
+        if crate::sidecar::RESTART_IN_PROGRESS.load(Ordering::Acquire) {
+            // A manual/onboarding restart owns the sidecar — reset our failure
+            // counter + backoff ladder and let it take over (ever_healthy is a
+            // lifetime latch, never reset).
+            hb_fails = 0;
+            attempt = 0;
+            continue;
+        }
+
+        // Detection: read the process-liveness bit + owned health-probe inputs
+        // WITHOUT holding the Tauri State across the HTTP await below.
+        let (proc_dead, port, client, token) = {
+            let ctx = match lookup_restart_state(&app) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "supervisor: state lookup failed");
+                    continue;
+                }
+            };
+            // R5/R6: never take(), poison-recovered lock — see child_has_exited.
+            let proc_dead = crate::sidecar::child_has_exited(&ctx.child_state.0);
+            (
+                proc_dead,
+                ctx.port_state.get(),
+                ctx.http_client.clone(),
+                ctx.auth_token.clone(),
+            )
+        };
+
+        // HTTP liveness (external review BLOCKER 1): catches a hung-but-alive sidecar that
+        // `try_wait` alone would miss.
+        let http_ok = {
+            let url = format!("http://127.0.0.1:{port}/admin/system/health");
+            matches!(
+                client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .timeout(std::time::Duration::from_millis(1500))
+                    .send()
+                    .await,
+                Ok(resp) if resp.status().is_success()
+            )
+        };
+        if http_ok {
+            ever_healthy = true;
+            hb_fails = 0;
+            attempt = 0; // healthy → reset the backoff ladder
+        } else {
+            hb_fails = hb_fails.saturating_add(1);
+        }
+        // A crash (definite process exit) always counts. A hang (HTTP failing on a
+        // still-running process) counts ONLY once the app has EVER been healthy —
+        // defers the first boot to poll_sidecar_health; stays armed thereafter.
+        let dead = crate::sidecar::sidecar_dead(proc_dead, ever_healthy, hb_fails);
+
+        if !crate::sidecar::should_restart(
+            dead,
+            crate::lifecycle::is_shutting_down(),
+            crate::sidecar::RESTART_IN_PROGRESS.load(Ordering::Acquire),
+        ) {
+            continue;
+        }
+
+        // Backoff BEFORE taking the exclusive restart guard, so a manual/onboarding
+        // restart is never blocked while we wait (Review MEDIUM). Never gives up —
+        // supervisor_backoff saturates at the ceiling.
+        let delay = crate::sidecar::supervisor_backoff(attempt);
+        attempt = attempt.saturating_add(1);
+        if !delay.is_zero() {
+            let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(delay)).await;
+        }
+        // Re-evaluate after the (possibly long) backoff sleep: shutdown may have
+        // begun, or a manual restart may have taken over.
+        if crate::lifecycle::is_shutting_down() {
+            return;
+        }
+        if crate::sidecar::RESTART_IN_PROGRESS.load(Ordering::Acquire) {
+            hb_fails = 0;
+            attempt = 0;
+            continue;
+        }
+        // Serialize against a concurrent manual restart (R3).
+        if !restart_try_acquire() {
+            continue;
+        }
+        let _guard = RestartGuard;
+
+        // The sidecar may have recovered DURING the backoff (self-heal, or a
+        // manual restart that finished). Confirm it is still down before we
+        // kill+respawn — never kill a healthy sidecar (self-review).
+        if supervisor_sidecar_healthy(&app).await {
+            ever_healthy = true;
+            hb_fails = 0;
+            attempt = 0;
+            continue;
+        }
+
+        match respawn_same_port(app.clone()).await {
+            Ok(()) => {
+                // Respawn confirmed healthy (wait_for_sidecar_health passed).
+                ever_healthy = true;
+                hb_fails = 0;
+                attempt = 0;
+            }
+            Err(e) => {
+                // The respawn spent its full generous health budget without
+                // becoming healthy → genuinely failed. Keep detection armed
+                // (ever_healthy is a lifetime latch) so the next cycle re-detects
+                // via hb_fails/proc_dead and retries with a longer backoff —
+                // NEVER go blind here (Round-2 HIGH). hb_fails resets so the
+                // re-detection restarts cleanly.
+                tracing::warn!(error = %e, attempt, "supervisor: respawn failed — will retry");
+                hb_fails = 0;
+            }
+        }
+        // `_guard` drops here → RESTART_IN_PROGRESS released.
+    }
 }
 
 fn setup_services(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -1056,6 +1436,10 @@ fn setup_services(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>
         health_client,
     ));
 
+    // WSH-001: runtime supervisor — respawns the sidecar on the same port if it
+    // dies/hangs so the plugin UI reconnects on its own `/status` poll.
+    tauri::async_runtime::spawn(sidecar_supervisor(app.handle().clone()));
+
     Ok(())
 }
 
@@ -1149,52 +1533,60 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
                 }
             }
             "uninstall" => {
-                tracing::info!("uninstall from tray");
-                let app = app.clone();
-                tauri::async_runtime::spawn_blocking(move || {
-                    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
-                    let confirmed = app
-                        .dialog()
-                        .message("This will remove all data, downloaded models, and settings. You can reinstall by opening the app again.\n\nAixò esborrarà totes les dades, models descarregats i configuració. Pots reinstal·lar obrint l'app de nou.")
-                        .title("Uninstall nexe-app?")
-                        .kind(MessageDialogKind::Warning)
-                        .buttons(MessageDialogButtons::OkCancel)
-                        .blocking_show();
-                    if confirmed {
-                        // B058: kill the sidecar FIRST so it cannot keep writing
-                        // to storage/vectors/models while we delete them (SQLite/
-                        // Qdrant corruption, or files re-created racing the wipe).
-                        if let Some(state) = app.try_state::<crate::SidecarChild>() {
-                            crate::lifecycle::kill_sidecar_child(&state.0);
-                        }
-                        // B058: report failures instead of the old unconditional
-                        // "uninstall complete" — tell the user the truth.
-                        let report = crate::onboarding_cmd::full_uninstall(&app);
-                        if report.all_ok() {
-                            tracing::info!("uninstall complete — exiting");
-                        } else {
-                            tracing::error!(failures = ?report.failures, "uninstall finished with errors");
-                            let detail = report.failures.join("\n");
-                            let _ = app
-                                .dialog()
-                                .message(format!(
-                                    "Some items could not be removed and may remain on disk:\n\n{detail}\n\nAlgunes dades no s'han pogut esborrar i poden quedar al disc."
-                                ))
-                                .title("Uninstall incomplete")
-                                .kind(MessageDialogKind::Warning)
-                                .blocking_show();
-                        }
-                        // MC-057: mark exit as confirmed BEFORE app.exit(0) so the
-                        // ExitRequested handler does not pop a second "Quit?" dialog
-                        // (data is already gone — re-prompting makes no sense). This
-                        // is also why the sidecar must be killed above: with
-                        // EXIT_CONFIRMED set, ExitRequested no longer routes through
-                        // graceful_quit, which used to be what killed it.
-                        crate::lifecycle::EXIT_CONFIRMED
-                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                        app.exit(0);
+                // Finding B: the uninstall is a SELECTIVE modal (checkboxes for
+                // models / conversations / library / ollama) rendered in a
+                // DEDICATED Tauri window (label "uninstall", page uninstall.html)
+                // so the user can pick exactly what to wipe for a clean reinstall.
+                //
+                // Why a dedicated window and NOT an event to the main webview:
+                // after onboarding the main webview navigates to the sidecar HTTP
+                // origin (main.js `window.location.replace(...)`), where our JS no
+                // longer runs — an emitted `open-uninstall-dialog` would be dead
+                // exactly in the normal post-onboarding case. The window always
+                // works. The actual removal runs in `uninstall_with_options`,
+                // which has its OWN native confirmation gate (WSA-002) and
+                // replicates the shutdown concurrency contract (WSH-001/B058/
+                // MC-057). `full_uninstall`/`reset_paths` are kept for compat +
+                // tests.
+                tracing::info!("uninstall from tray — opening dedicated window");
+                if let Some(win) = app.get_webview_window("uninstall") {
+                    // Already open — surface it instead of stacking a second one.
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                } else {
+                    // WebView2 (Windows): tots els webviews del mateix procés han
+                    // d'usar els MATEIXOS additionalBrowserArguments. La finestra
+                    // "main" posa --host-resolver-rules a tauri.conf.json; una 2a
+                    // finestra creada sense ells rebria el default de wry
+                    // (--disable-features només) → l'entorn compartit no coincideix i
+                    // CreateCoreWebView2Controller falla amb ERROR_INVALID_STATE
+                    // (0x8007139F): uninstall.html no carrega i uninstall_with_options
+                    // no s'arriba a invocar. Heretem els args de la "main" perquè
+                    // coincideixin (no-op a macOS/Linux, on aquest flag no s'aplica).
+                    let mut builder = tauri::WebviewWindowBuilder::new(
+                        app,
+                        "uninstall",
+                        tauri::WebviewUrl::App("uninstall.html".into()),
+                    )
+                    .title("Uninstall nexe-app")
+                    .inner_size(480.0, 460.0)
+                    .resizable(false)
+                    .center();
+                    if let Some(args) = app
+                        .config()
+                        .app
+                        .windows
+                        .iter()
+                        .find(|w| w.label == "main")
+                        .and_then(|w| w.additional_browser_args.clone())
+                    {
+                        builder = builder.additional_browser_args(&args);
                     }
-                });
+                    match builder.build() {
+                        Ok(_) => tracing::info!("uninstall window created"),
+                        Err(e) => tracing::error!(error = %e, "failed to open uninstall window"),
+                    }
+                }
             }
             "quit" => {
                 // Tray Quit → centralized graceful_quit.
@@ -1304,7 +1696,11 @@ pub fn run() {
                         return;
                     }
                 };
-                if !rate_limit_ok_for(&plugin_id) {
+                // WSC-003: per-plugin bucket (fairness) + shared GLOBAL bucket.
+                // plugin_id comes from the attacker-controlled URI, so the
+                // per-id bucket alone is evadable by minting fresh ids; the
+                // global bucket bounds total throughput regardless.
+                if !plugin_rate_limits_ok(&plugin_id) {
                     responder.respond(err_response(429, b"too many requests"));
                     return;
                 }
@@ -1345,10 +1741,20 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Unification 2026-04-19: X, Alt+F4, tray Quit all show
-            // the same "are you sure?" dialog. X no longer does silent hide.
-            // To hide without closing, use the "Hide" option in the tray menu.
             if let WindowEvent::CloseRequested { api, .. } = event {
+                // C1 (HIGH): the "Quit?" confirmation belongs ONLY to the main
+                // window. This handler is global, so without the label branch
+                // Cancel/X on the dedicated "uninstall" window (or any future
+                // auxiliary window) would prevent_close + graceful_quit the WHOLE
+                // app — closing the dialog would try to quit nexe-app. For any
+                // non-main label we leave `api` untouched so Tauri closes just
+                // that window and the app keeps running.
+                if window.label() != "main" {
+                    return;
+                }
+                // Unification 2026-04-19: X, Alt+F4, tray Quit all show the same
+                // "are you sure?" dialog. X no longer does silent hide. To hide
+                // without closing, use the "Hide" option in the tray menu.
                 api.prevent_close();
                 graceful_quit(window.app_handle());
             }
@@ -1373,7 +1779,10 @@ pub fn run() {
             // open external URLs in system browser (target="_blank" workaround)
             open_external_url,
             // restart sidecar to pick up post-wizard onboarding state.
-            restart_sidecar
+            restart_sidecar,
+            // Finding B: selective uninstall (models/conversations/library/ollama)
+            // driven by the frontend modal; has its OWN native WSA-002 gate.
+            uninstall_with_options
         ])
         // unwrap_or_else — clear message + exit(1) without panic
         .build(tauri::generate_context!())
@@ -1743,23 +2152,43 @@ mod tests {
         assert!(res.is_err(), "null byte allowed: {:?}", res);
     }
 
+    // WSH-005 — post-poll decision. Mutation: reverting poll_sidecar_health
+    // to the old "same break for success and timeout, then navigate anyway"
+    // behaviour corresponds to mapping (false, false) to Navigate — the
+    // third assertion catches it.
+    #[test]
+    fn post_poll_action_never_navigates_on_timeout() {
+        assert_eq!(post_poll_action(true, false), PostPollAction::Navigate);
+        assert_eq!(post_poll_action(true, true), PostPollAction::DeferToWizard);
+        assert_eq!(
+            post_poll_action(false, false),
+            PostPollAction::StayAndNotify,
+            "timeout on a normal run must stay on the splash and notify, never navigate"
+        );
+        assert_eq!(
+            post_poll_action(false, true),
+            PostPollAction::StayQuiet,
+            "timeout during first run must not clobber the wizard with an event"
+        );
+    }
+
     // rate limiter resets per window
     #[test]
     fn rate_limit_per_plugin_allows_under_threshold() {
-        // rate_limit_ok_for(plugin) returns true under limit.
+        // The combined gate (per-plugin + global, WSC-003) returns true under limit.
         // We do not test exact rejection (shared global state).
-        assert!(rate_limit_ok_for("test_a"));
-        assert!(rate_limit_ok_for("test_a"));
+        assert!(plugin_rate_limits_ok("test_a"));
+        assert!(plugin_rate_limits_ok("test_a"));
     }
 
     #[test]
     fn rate_limit_per_plugin_isolated_between_plugins() {
         // Plugin A and plugin B have independent counters.
         for _ in 0..500 {
-            let _ = rate_limit_ok_for("isolated_a");
+            let _ = crate::rate_limit::rate_limit_ok_for("isolated_a");
         }
         // B starts at zero, must not be affected by A's consumption
-        assert!(rate_limit_ok_for("isolated_b"));
+        assert!(crate::rate_limit::rate_limit_ok_for("isolated_b"));
     }
 
     // 4 new tests for validate_request
@@ -2223,7 +2652,7 @@ mod tests {
         // Insert 600 different IDs (> RATE_LIMIT_LRU_CAP = 500)
         for i in 0..600 {
             let id = format!("plugin{:04}", i);
-            let _ = rate_limit_ok_for(&id);
+            let _ = crate::rate_limit::rate_limit_ok_for(&id);
         }
         let guard = rate_limiters().lock().unwrap();
         assert!(
@@ -2459,7 +2888,7 @@ mod tests {
     fn rate_limit_no_duplicate_entry_same_id() {
         let id = "c30_stable_id_unique_xyz";
         for _ in 0..1000 {
-            let _ = rate_limit_ok_for(id);
+            let _ = crate::rate_limit::rate_limit_ok_for(id);
         }
         let guard = rate_limiters().lock().unwrap();
         // Exactly 1 entry for our id (no duplication from repeated alloc).
@@ -2807,5 +3236,39 @@ mod tests {
             err_403 + ok_benign > 0,
             "test did not exercise any real request"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // WSA-004 / WSD-003 / WSE-002 — open_external_url host+scheme allowlist.
+    // The old starts_with("http") gate let ANY origin through
+    // (phishing/drive-by). is_allowed_external_url parses scheme AND host.
+    // ─────────────────────────────────────────────────────────────────
+    #[test]
+    fn external_url_allows_allowlisted_hosts_and_subdomains() {
+        assert!(is_allowed_external_url("https://server-nexe.com"));
+        assert!(is_allowed_external_url("http://server-nexe.com"));
+        assert!(is_allowed_external_url("https://server-nexe.com/trajectoria"));
+        assert!(is_allowed_external_url("https://docs.server-nexe.com/x"));
+        assert!(is_allowed_external_url("https://huggingface.co/settings/tokens"));
+        // host comparison is case-insensitive
+        assert!(is_allowed_external_url("https://SERVER-NEXE.COM/x"));
+    }
+
+    #[test]
+    fn external_url_rejects_foreign_hosts_and_bad_schemes() {
+        // Foreign origin — the core phishing vector the prefix check allowed.
+        assert!(!is_allowed_external_url("https://evil.example/phish"));
+        // Suffix / lookalike tricks must NOT match the allowlist.
+        assert!(!is_allowed_external_url("https://server-nexe.com.evil.com/x"));
+        assert!(!is_allowed_external_url("https://evilserver-nexe.com/x"));
+        assert!(!is_allowed_external_url("https://notserver-nexe.com"));
+        // Non-http(s) schemes.
+        assert!(!is_allowed_external_url("javascript:alert(1)"));
+        assert!(!is_allowed_external_url("file:///etc/passwd"));
+        assert!(!is_allowed_external_url("ftp://server-nexe.com/x"));
+        // Unparseable / hostless.
+        assert!(!is_allowed_external_url("server-nexe.com"));
+        assert!(!is_allowed_external_url(""));
+        assert!(!is_allowed_external_url("https://"));
     }
 }

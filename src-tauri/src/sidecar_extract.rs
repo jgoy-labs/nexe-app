@@ -250,6 +250,20 @@ fn verify_tarball_sha256(app: &tauri::AppHandle, tarball: &std::path::Path) -> R
             return Ok(());
         }
     };
+    verify_tarball_against_digest_path(tarball, &digest_resource)
+}
+
+/// Apply the transitional fail-open policy to an *already-resolved* digest path.
+/// Split out of [`verify_tarball_sha256`] so the two skip branches (missing file
+/// / empty file) can be unit-tested without a Tauri `AppHandle`. Behaviour is
+/// identical to the previously-inlined version: a missing or empty digest file
+/// skips verification and returns `Ok(())`; a present, non-empty digest file is
+/// verified against `tarball`.
+#[cfg_attr(debug_assertions, allow(dead_code))]
+fn verify_tarball_against_digest_path(
+    tarball: &std::path::Path,
+    digest_resource: &std::path::Path,
+) -> Result<(), String> {
     if !digest_resource.is_file() {
         tracing::warn!(
             path = %digest_resource.display(),
@@ -260,7 +274,7 @@ fn verify_tarball_sha256(app: &tauri::AppHandle, tarball: &std::path::Path) -> R
     // Tolerate empty placeholder created by build.rs for `cargo test` / CI
     // (`pnpm tauri build --no-bundle`). Treating it as "no digest available"
     // matches the `read_sidecar_sha256` fallback so both paths agree.
-    if std::fs::metadata(&digest_resource)
+    if std::fs::metadata(digest_resource)
         .map(|m| m.len() == 0)
         .unwrap_or(false)
     {
@@ -270,7 +284,7 @@ fn verify_tarball_sha256(app: &tauri::AppHandle, tarball: &std::path::Path) -> R
         );
         return Ok(());
     }
-    verify_sha256_against_digest_file(tarball, &digest_resource)
+    verify_sha256_against_digest_file(tarball, digest_resource)
 }
 
 /// Pure helper extracted from [`verify_tarball_sha256`] so it can be exercised
@@ -500,5 +514,181 @@ mod tests {
         let lock_path = root.join(".extract.lock");
         // File does not exist — unwrap_or(false) in is_lock_stale
         assert!(!super::is_lock_stale(&lock_path));
+    }
+
+    // ─── BONUS-003 — verify_tarball_against_digest_path fail-open branches ─────
+    // Pins the transitional policy so a packaging bug (dropped/empty .sha256) or
+    // a refactor cannot silently flip skip↔verify without a failing test.
+
+    /// Missing digest file → fail-open skip (transitional). Note this is the
+    /// OPPOSITE of `verify_sha256_against_digest_file`, which errors on a missing
+    /// digest — the skip lives in this seam, and this test locks it in.
+    #[test]
+    fn digest_missing_skips_verification() {
+        let root = mktemp_root("digest-missing");
+        let tarball = write_fixture(&root, "bundle.tar.gz", KNOWN_PAYLOAD);
+        let digest = root.join("does-not-exist.sha256");
+        super::verify_tarball_against_digest_path(&tarball, &digest)
+            .expect("missing digest must fail-open (transitional skip)");
+    }
+
+    /// Empty digest file (CI/build.rs placeholder) → fail-open skip. Again the
+    /// opposite of the terminal helper, which errors on an empty file.
+    #[test]
+    fn digest_empty_skips_verification() {
+        let root = mktemp_root("digest-empty-skip");
+        let tarball = write_fixture(&root, "bundle.tar.gz", KNOWN_PAYLOAD);
+        let digest = write_fixture(&root, "bundle.sha256", b"");
+        super::verify_tarball_against_digest_path(&tarball, &digest)
+            .expect("empty digest must fail-open (transitional skip)");
+    }
+
+    /// Present + matching digest → verifies and passes.
+    #[test]
+    fn digest_present_matching_passes() {
+        let root = mktemp_root("digest-present-match");
+        let tarball = write_fixture(&root, "bundle.tar.gz", KNOWN_PAYLOAD);
+        let digest = write_fixture(&root, "bundle.sha256", KNOWN_SHA256.as_bytes());
+        super::verify_tarball_against_digest_path(&tarball, &digest)
+            .expect("present matching digest must pass");
+    }
+
+    /// Present + mismatched digest → hard failure (tamper rejection end-to-end
+    /// through the same seam `verify_tarball_sha256` uses).
+    #[test]
+    fn digest_present_mismatch_fails() {
+        let root = mktemp_root("digest-present-mismatch");
+        let tarball = write_fixture(&root, "bundle.tar.gz", KNOWN_PAYLOAD);
+        let bogus = "1".repeat(64);
+        let digest = write_fixture(&root, "bundle.sha256", bogus.as_bytes());
+        let err = super::verify_tarball_against_digest_path(&tarball, &digest)
+            .expect_err("present mismatched digest must fail");
+        assert!(err.contains("SHA-256 mismatch"), "got {err:?}");
+    }
+
+    // ─── BONUS-002 — tar extraction traversal / symlink-escape regression pins ─
+    // The `tar` crate sanitises `..` and symlink-escapes on unpack today; these
+    // tests pin that behaviour so a `tar` bump or a set_preserve_permissions/
+    // symlink-follow change can't silently weaken it undetected.
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut enc =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Recompute the ustar header checksum for a 512-byte header block after its
+    /// name field has been tampered with. The `tar` builder refuses to *write* a
+    /// `..` path, so we forge one by patching the name bytes and re-signing.
+    fn fix_ustar_cksum(block: &mut [u8]) {
+        assert_eq!(block.len(), 512);
+        // Checksum is computed with the 8-byte chksum field (148..156) as spaces.
+        for b in block[148..156].iter_mut() {
+            *b = b' ';
+        }
+        let sum: u32 = block.iter().map(|&b| b as u32).sum();
+        let digits = format!("{sum:06o}");
+        block[148..154].copy_from_slice(digits.as_bytes());
+        block[154] = 0;
+        block[155] = b' ';
+    }
+
+    /// Run the exact production extraction path: GzDecoder + `Archive::unpack`
+    /// with `set_overwrite(true)`, into `dest`.
+    fn unpack_gz_into(gz: &[u8], dest: &std::path::Path) -> Result<(), String> {
+        let gzr = flate2::read::GzDecoder::new(std::io::Cursor::new(gz.to_vec()));
+        let mut archive = tar::Archive::new(gzr);
+        archive.set_overwrite(true);
+        archive.unpack(dest).map_err(|e| e.to_string())
+    }
+
+    /// A tarball whose first entry name is `../escape` must never write outside
+    /// the destination dir.
+    #[test]
+    fn tar_unpack_rejects_parent_dir_traversal() {
+        let root = mktemp_root("tar-traversal");
+        let dest = root.join("sidecar");
+        fs::create_dir_all(&dest).unwrap();
+
+        // Build a valid tar with placeholder name `zz/escape`, then forge the
+        // name into `../escape` and re-sign the header (the builder rejects `..`).
+        let mut builder = tar::Builder::new(Vec::new());
+        let payload = b"pwned";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(payload.len() as u64);
+        h.set_mode(0o644);
+        h.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut h, "zz/escape", &payload[..])
+            .unwrap();
+        // A safe sibling so the archive still contains something extractable.
+        let mut hs = tar::Header::new_gnu();
+        hs.set_size(payload.len() as u64);
+        hs.set_mode(0o644);
+        hs.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut hs, "safe.txt", &payload[..])
+            .unwrap();
+        let mut tar_bytes = builder.into_inner().unwrap();
+
+        // Forge `zz/escape` → `../escape` in the first header's name field (0..).
+        assert_eq!(&tar_bytes[0..9], &b"zz/escape"[..]);
+        tar_bytes[0] = b'.';
+        tar_bytes[1] = b'.';
+        fix_ustar_cksum(&mut tar_bytes[0..512]);
+
+        let gz = gzip(&tar_bytes);
+        // `tar` sanitises `..` by skipping the entry (unpack may still be Ok).
+        let _ = unpack_gz_into(&gz, &dest);
+
+        // The forged entry must NOT have escaped to `<root>/escape`.
+        let escaped = root.join("escape");
+        assert!(
+            !escaped.exists(),
+            "path-traversal entry escaped extraction dir: {}",
+            escaped.display()
+        );
+        assert!(!dest.join("escape").exists());
+    }
+
+    /// A symlink pointing outside the destination followed by a file written
+    /// *through* it must never create anything outside the destination dir.
+    #[test]
+    fn tar_unpack_rejects_symlink_escape() {
+        let root = mktemp_root("tar-symlink");
+        let dest = root.join("sidecar");
+        fs::create_dir_all(&dest).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        // symlink `link` -> `../escape_target` (resolves outside `dest`).
+        let mut lh = tar::Header::new_gnu();
+        lh.set_size(0);
+        lh.set_mode(0o777);
+        lh.set_entry_type(tar::EntryType::Symlink);
+        builder
+            .append_link(&mut lh, "link", "../escape_target")
+            .unwrap();
+        // file `link/evil.txt` that would land in `../escape_target/` if the
+        // symlink were followed during extraction.
+        let payload = b"evil";
+        let mut fh = tar::Header::new_gnu();
+        fh.set_size(payload.len() as u64);
+        fh.set_mode(0o644);
+        fh.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut fh, "link/evil.txt", &payload[..])
+            .unwrap();
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let gz = gzip(&tar_bytes);
+        let _ = unpack_gz_into(&gz, &dest);
+
+        // Nothing may have been written outside `dest`.
+        assert!(
+            !root.join("escape_target").exists(),
+            "symlink escape created files outside extraction dir"
+        );
     }
 }

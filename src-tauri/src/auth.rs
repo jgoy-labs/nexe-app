@@ -158,38 +158,27 @@ impl ApiKey {
     }
 }
 
-/// Path prefixes that the frontend must NOT reach via `fetch_from_sidecar`.
+/// Path prefixes the frontend IS allowed to reach via `fetch_from_sidecar`.
 ///
-/// These endpoints are managed exclusively by Rust lifecycle commands (e.g.
-/// `graceful_quit` calls /shutdown directly). Allowing the webview to trigger
-/// them would let any plugin or XSS vector shut down the sidecar.
+/// WSA-001 (2026-07-12): the Phase-2 migration announced in the previous
+/// blocklist doc comment is done — the guard is now an explicit ALLOWLIST.
+/// The proxy injects the admin Bearer token, so every path it forwards runs
+/// with full admin authority; the surface must therefore be enumerated, not
+/// subtracted. The frontend's only legitimate uses of the proxy (main.js) are:
 ///
-/// (2026-05-18): the previous list compared `path` against
-/// these strings with `.contains(&path)`, i.e. exact equality. An attacker
-/// could trivially bypass the guard with `/api/v1/system/shutdown/` (trailing
-/// slash), `/API/V1/system/SHUTDOWN` (case variation),
-/// `/api/v1/system/shutdown?foo=bar` (query string) or
-/// `/api/v1/system/shutdown/x` (suffix). The guard is now a prefix match
-/// over a normalised path (lower-cased, query/fragment stripped, trailing
-/// slash trimmed) and covers both the legacy `/api/v1/...` mount and the
-/// `/admin/...` mount introduced later.
+///   - `GET /admin/system/health` — splash-screen boot polling.
+///   - `GET /ui/...` — pre-navigation reachability probe of the web UI.
 ///
-/// Phase 2 migration: replace this blocklist with an explicit path allowlist
-/// once the server-nexe API surface is stable and fully enumerated.
-const SIDECAR_BLOCKED_PATH_PREFIXES: &[&str] = &[
-    "/api/v1/system/shutdown",
-    "/api/v1/system/restart",
-    "/admin/system/shutdown",
-    "/admin/system/restart",
-    // The `/v1` mount itself currently exposes no lifecycle endpoints, but
-    // anyone adding `/v1/system/shutdown` later (mirroring `/admin/system/*`)
-    // would silently widen the attack surface. Block them defensively so
-    // future endpoint additions do not regress this guard.
-    "/v1/system/shutdown",
-    "/v1/system/restart",
-];
+/// The onboarding wizard does NOT go through this proxy (it uses direct
+/// `fetch()` against `/installer/*`), so it is unaffected.
+///
+/// Entries are stored in NORMALISED form (lower-case, no trailing slash — see
+/// `normalize_sidecar_path`) and matched as `prefix` exactly or `prefix + "/..."`.
+/// Lifecycle endpoints (`/admin/system/shutdown`, `/.../restart`) stay
+/// Rust-managed and are implicitly denied like everything else.
+const SIDECAR_ALLOWED_PATH_PREFIXES: &[&str] = &["/admin/system/health", "/ui"];
 
-/// Normalise a request path for blocklist matching.
+/// Normalise a request path for allowlist matching.
 ///
 /// Strips the query string and fragment, then *canonicalises* the path so that
 /// router-equivalent spellings collapse to one form before the prefix check.
@@ -201,11 +190,19 @@ const SIDECAR_BLOCKED_PATH_PREFIXES: &[&str] = &[
 /// guard must do the same. We rebuild the path from its segments: empty
 /// segments (from `//`) and `.` are dropped, `..` pops the parent (clamped at
 /// root), then everything is lower-cased for case-insensitive matching.
-fn normalize_path_for_blocklist(path: &str) -> String {
+fn normalize_sidecar_path(path: &str) -> String {
     let no_query = path.split('?').next().unwrap_or(path);
     let no_fragment = no_query.split('#').next().unwrap_or(no_query);
+    // WSA-001: percent-decode BEFORE splitting so an encoded slash (%2f) or
+    // dot (%2e) collapses the same way uvicorn/ASGI unquotes the path prior
+    // to routing. Without this, `/ui/..%2fadmin/system/shutdown` stays verbatim
+    // and passes the `/ui` prefix — an escape the literal `/ui/../admin/...`
+    // form already blocks. Owned String so the segment borrows outlive it.
+    let decoded: String = percent_encoding::percent_decode_str(no_fragment)
+        .decode_utf8_lossy()
+        .into_owned();
     let mut segments: Vec<&str> = Vec::new();
-    for segment in no_fragment.split('/') {
+    for segment in decoded.split('/') {
         match segment {
             "" | "." => continue, // collapse `//`, leading/trailing `/`, and `.`
             ".." => {
@@ -217,20 +214,26 @@ fn normalize_path_for_blocklist(path: &str) -> String {
     format!("/{}", segments.join("/")).to_ascii_lowercase()
 }
 
-/// Path-level guard for `fetch_from_sidecar`.
+/// Path-level guard for `fetch_from_sidecar` — default-deny allowlist.
 ///
-/// Returns `Err("BLOCKED_PATH")` whenever the normalised path matches any
-/// entry in `SIDECAR_BLOCKED_PATH_PREFIXES` either exactly or as a directory
-/// prefix (`prefix` itself or `prefix + "/..."`). Called after
+/// Returns `Ok(())` only when the normalised path matches an entry in
+/// `SIDECAR_ALLOWED_PATH_PREFIXES` either exactly or as a directory prefix
+/// (`prefix` itself or `prefix + "/..."`); everything else returns
+/// `Err("BLOCKED_PATH")`. Normalisation (dot-segments, repeated slashes,
+/// case, query/fragment) runs BEFORE the match, so `/ui/../admin/x` is
+/// judged as `/admin/x`, not as something under `/ui`. Called after
 /// `validate_sidecar_url` has already confirmed host/port/scheme.
+///
+/// The boundary check matters: `/ui` and `/ui/index.html` pass, but `/uix`
+/// must not — a bare `starts_with("/ui")` would over-allow it.
 pub(crate) fn validate_sidecar_path(path: &str) -> Result<(), &'static str> {
-    let normalised = normalize_path_for_blocklist(path);
-    for prefix in SIDECAR_BLOCKED_PATH_PREFIXES {
+    let normalised = normalize_sidecar_path(path);
+    for prefix in SIDECAR_ALLOWED_PATH_PREFIXES {
         if normalised == *prefix || normalised.starts_with(&format!("{prefix}/")) {
-            return Err("BLOCKED_PATH");
+            return Ok(());
         }
     }
-    Ok(())
+    Err("BLOCKED_PATH")
 }
 
 /// **Phase 2 Skeleton** — `fetch_from_sidecar` intercepts calls to the
@@ -278,8 +281,9 @@ pub(crate) fn validate_sidecar_path(path: &str) -> Result<(), &'static str> {
 /// # Errors
 ///
 /// Returns `Err(String)` with static codes (`INVALID_URL`, `INVALID_HOST`,
-/// `INVALID_METHOD`, `METHOD_DOES_NOT_ACCEPT_BODY`) or dynamic codes
-/// (`reqwest send: ...`, `body decode: ...`) when the error comes from the HTTP client.
+/// `INVALID_METHOD`, `METHOD_DOES_NOT_ACCEPT_BODY`, `BLOCKED_PATH`,
+/// `RATE_LIMITED`) or dynamic codes (`reqwest send: ...`, `body decode: ...`)
+/// when the error comes from the HTTP client.
 #[tauri::command]
 pub(crate) async fn fetch_from_sidecar(
     auth_state: tauri::State<'_, AuthToken>,
@@ -309,7 +313,8 @@ pub(crate) async fn fetch_from_sidecar(
         return Err(code.into());
     }
 
-    // Path-level blocklist — reject Rust-managed endpoints (e.g. /shutdown).
+    // Path-level allowlist (WSA-001) — only enumerated frontend paths pass;
+    // Rust-managed endpoints (e.g. /shutdown) and everything else are denied.
     // URL was already validated above, so a second parse cannot fail.
     let parsed_for_path = Url::parse(&url).map_err(|_| "INVALID_URL".to_string())?;
     if let Err(code) = validate_sidecar_path(parsed_for_path.path()) {
@@ -320,6 +325,23 @@ pub(crate) async fn fetch_from_sidecar(
             "rejected blocked sidecar path"
         );
         return Err(code.into());
+    }
+
+    // WSC-003: global rate limit. This proxy runs with the admin Bearer
+    // token, and unlike the plugin:// protocol it had NO limiter — an
+    // XSS-driven flood could hammer the sidecar unbounded. One fixed-key
+    // bucket bounds the total (there is no per-caller identity here; the only
+    // legitimate caller is main.js). The equivalent of an HTTP 429: the IPC
+    // returns error codes as strings, so the caller sees "RATE_LIMITED".
+    // Capacity sized against the real boot cadence — see
+    // rate_limit::SIDECAR_GLOBAL_RATE_CAPACITY (~6 req/s worst case vs 100).
+    if !crate::rate_limit::sidecar_global_rate_ok() {
+        tracing::warn!(
+            target: "auth::fetch_from_sidecar",
+            %url,
+            "rejected: global sidecar rate limit exceeded (WSC-003)"
+        );
+        return Err("RATE_LIMITED".into());
     }
 
     // Bug fix: shared client from state (registered at setup()). `Client`
@@ -645,11 +667,12 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // Fase 2 prep — `validate_sidecar_path` blocklist tests
+    // WSA-001 — `validate_sidecar_path` ALLOWLIST tests (default-deny)
     // ─────────────────────────────────────────────────────────────────
 
-    /// Blocked paths return BLOCKED_PATH. Mutation: removing the path from
-    /// SIDECAR_BLOCKED_PATHS makes this test fail.
+    /// Lifecycle endpoints are not in the allowlist → BLOCKED_PATH. Mutation:
+    /// adding a system/lifecycle prefix to SIDECAR_ALLOWED_PATH_PREFIXES makes
+    /// this test fail.
     #[test]
     fn validate_sidecar_path_blocks_shutdown() {
         assert_eq!(
@@ -659,8 +682,8 @@ mod tests {
         );
     }
 
-    /// Bypass attempts that the previous exact-match guard
-    /// allowed must now all return BLOCKED_PATH after the normalisation.
+    /// Normalisation-evasion spellings of lifecycle endpoints stay blocked
+    /// under the allowlist (they normalise to paths outside the allowlist).
     #[test]
     fn validate_sidecar_path_blocks_normalised_bypasses() {
         let bypasses = [
@@ -700,48 +723,71 @@ mod tests {
         }
     }
 
-    /// Allow-list sentinel: paths that contain "shutdown" or "restart" as a
-    /// substring but live outside the system mount must keep working.
+    /// Default-deny: former API paths that the blocklist let through are now
+    /// blocked; only the two enumerated frontend surfaces pass. Mutation:
+    /// reverting the guard to a blocklist makes the first half fail.
     #[test]
-    fn validate_sidecar_path_does_not_overblock_substrings() {
-        let allowed = [
-            "/api/v1/knowledge/shutdown-procedures",
-            "/api/v1/chat/restart-conversation",
-            "/api/v1/memory/restart_flag",
-        ];
-        for path in allowed {
-            assert_eq!(
-                validate_sidecar_path(path),
-                Ok(()),
-                "substring match alone must not trigger BLOCKED_PATH for {path:?}"
-            );
-        }
-    }
-
-    /// Normal API paths pass through unchanged.
-    #[test]
-    fn validate_sidecar_path_allows_normal_paths() {
-        let allowed = [
+    fn validate_sidecar_path_default_denies_unlisted_paths() {
+        let blocked = [
             "/api/v1/chat/",
             "/api/v1/chat/completions",
             "/api/v1/knowledge/search",
-            "/admin/system/health",
             "/api/v1/memory/query",
             "/health/ready",
             "/",
         ];
+        for path in blocked {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Err("BLOCKED_PATH"),
+                "path {path:?} is not in the allowlist and must be blocked"
+            );
+        }
+        let allowed = [
+            "/admin/system/health",
+            "/admin/system/health/",
+            "/ADMIN/System/Health",
+            "/ui",
+            "/ui/",
+            "/ui/index.html",
+            "/UI/index.html",
+            "/ui/assets/app.js?v=123",
+        ];
         for path in allowed {
             assert_eq!(
                 validate_sidecar_path(path),
                 Ok(()),
-                "path {path:?} should be allowed"
+                "path {path:?} is in the allowlist and must pass"
             );
         }
     }
 
-    /// Hardening: repeated leading slashes and dot-segments must not bypass the
-    /// blocklist. Routers normalise these back to the protected endpoint, so the
-    /// guard canonicalises the path before matching.
+    /// Prefix-boundary check: paths that merely SHARE CHARACTERS with an
+    /// allowlist entry must not pass. A bare `starts_with("/ui")` would
+    /// over-allow `/uix`; the guard requires `/ui` exact or `/ui/...`.
+    #[test]
+    fn validate_sidecar_path_allowlist_respects_segment_boundaries() {
+        let blocked = [
+            "/uix",
+            "/ui2/index.html",
+            "/uindex",
+            "/admin/system/healthz",
+            "/admin/system/health-extra",
+            "/admin/system",
+            "/admin",
+        ];
+        for path in blocked {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Err("BLOCKED_PATH"),
+                "path {path:?} shares a char-prefix with the allowlist but is a different segment — must be blocked"
+            );
+        }
+    }
+
+    /// Hardening: repeated leading slashes and dot-segments must not smuggle a
+    /// blocked endpoint past the allowlist. Routers normalise these spellings,
+    /// so the guard canonicalises the path before matching.
     #[test]
     fn validate_sidecar_path_blocks_slash_and_dot_bypasses() {
         let bypasses = [
@@ -773,20 +819,67 @@ mod tests {
         }
     }
 
-    /// The dot-segment canonicalisation must not over-block legitimate paths
-    /// that merely *resolve* to a non-system endpoint.
+    /// Dot-segments must not ESCAPE an allowed prefix: a path that starts
+    /// under `/ui/` but resolves outside it is judged by its resolved form.
+    #[test]
+    fn validate_sidecar_path_blocks_dot_segment_escape_from_allowed_prefix() {
+        let bypasses = [
+            "/ui/../admin/system/shutdown",
+            "/ui/../api/v1/chat/completions",
+            "/ui/..",
+            "/ui/../../etc/passwd",
+            "/ui/x/../../api/v1/memory/query",
+            "/admin/system/health/../shutdown",
+            "/admin/system/health/../../../",
+        ];
+        for path in bypasses {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Err("BLOCKED_PATH"),
+                "path {path:?} resolves outside the allowlist and must be blocked"
+            );
+        }
+    }
+
+    /// WSA-001: percent-encoded slashes/dots must not smuggle an escape past
+    /// the allowlist — the guard percent-decodes before matching, mirroring
+    /// how uvicorn/ASGI unquotes the path before routing.
+    #[test]
+    fn validate_sidecar_path_blocks_percent_encoded_escapes() {
+        let encoded_bypasses = [
+            "/ui/..%2fadmin/system/shutdown",
+            "/ui/..%2Fadmin/system/shutdown",
+            "/ui/%2e%2e/admin/system/shutdown",
+            "/ui/%2e%2e%2fadmin",
+            "/ui%2f..%2fapi/v1/chat",
+        ];
+        for path in encoded_bypasses {
+            assert_eq!(
+                validate_sidecar_path(path),
+                Err("BLOCKED_PATH"),
+                "encoded path {path:?} must decode to an escape and be blocked"
+            );
+        }
+        // A legitimately-encoded allowed path still passes.
+        assert_eq!(validate_sidecar_path("/ui/%69ndex.html"), Ok(()));
+    }
+
+    /// The dot-segment canonicalisation must not over-block spellings that
+    /// RESOLVE to an allowed path.
     #[test]
     fn validate_sidecar_path_dot_segments_do_not_overblock() {
         let allowed = [
-            "/api/v1/knowledge/../knowledge/search",
-            "/api/v1/./chat/completions",
-            "//api/v1/memory/query",
+            "/ui/../ui/x",
+            "/ui/./index.html",
+            "//ui/index.html",
+            "/admin/./system/health",
+            "/admin/system/../system/health",
         ];
         for path in allowed {
             assert_eq!(
                 validate_sidecar_path(path),
                 Ok(()),
-                "path {path:?} should be allowed after canonicalisation"
+                "path {path:?} resolves to an allowed path and must pass"
             );
         }
     }

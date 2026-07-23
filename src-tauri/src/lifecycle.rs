@@ -92,6 +92,17 @@ pub(crate) fn graceful_quit_should_start() -> bool {
     graceful_quit_try_acquire()
 }
 
+/// True once an intentional shutdown is underway — a quit was confirmed
+/// (`SHUTDOWN_STARTED`) or the exit is latched (`EXIT_CONFIRMED`). The sidecar
+/// supervisor (WSH-001) consults this every iteration and again right before a
+/// respawn, so it never restarts the sidecar while the app is closing or being
+/// uninstalled (guards R1/R2/R7). `Acquire` loads (paired with the flags'
+/// `Release`/`Relaxed` stores) guarantee the supervisor observes the flag once
+/// set rather than spinning on a stale `false`.
+pub(crate) fn is_shutting_down() -> bool {
+    SHUTDOWN_STARTED.load(Ordering::Acquire) || EXIT_CONFIRMED.load(Ordering::Acquire)
+}
+
 pub(crate) fn graceful_quit<R: Runtime>(app: &tauri::AppHandle<R>) {
     tracing::info!("graceful_quit invoked");
 

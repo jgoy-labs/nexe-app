@@ -139,6 +139,19 @@ function _filterBackendsByMetal(backends) {
   return (backends || []).filter((b) => metalOK || b.toLowerCase() !== "mlx");
 }
 
+// Pick the DEFAULT engine for a model. MLX (the first available backend) is
+// the default on every Mac with Metal — including 8 GB. History: the 18/07
+// fix defaulted <=8 GB to Ollama because the strict RAM guard made MLX a
+// dead-end there; the 23/07 field measurement (M1 8 GB) showed MLX loads and
+// generates fine (footprint 6.05 GB, ~2 GB swap, zero jetsam) and the guard
+// now defaults to warn, so the dead-end is gone. Product decision (Jordi,
+// 23/07): MLX default on Mac. ramGb is kept for signature stability.
+// Findings: NEXE-8GB-MLX-SELECTION (840) / NEXE-MLX-GUARD-DEADEND (841).
+export function _defaultBackend(availableBackends, ramGb) {  // eslint-disable-line no-unused-vars
+  const list = availableBackends || [];
+  return list[0];
+}
+
 // B054: does the current selection need an HF token at download time? Only
 // HF-hosted gated repos pulled via mlx/gguf — Ollama pulls the same model
 // from its own registry with no token. Exported for unit testing.
@@ -298,7 +311,8 @@ function _renderDropdownItem(model, { listWrap, triggerText, arrow }) {
   if (availableBackends.length === 0) return null;
   // Active engine: if the user cycled it for this model, respect _currentEngine
   // (in-memory inside the item, not persisted across models).
-  const currentEngineRaw = model._currentEngine || availableBackends[0];
+  const currentEngineRaw =
+    model._currentEngine || _defaultBackend(availableBackends, state.hardware?.ram_gb);
   const primaryEngine = currentEngineRaw.toLowerCase().replace("llama.cpp", "gguf");
   const modelId = _deriveModelId(model, primaryEngine);
   // `disabled` class if the model does not fit in RAM.
@@ -340,7 +354,7 @@ function _renderDropdownItem(model, { listWrap, triggerText, arrow }) {
       // engine badge mutates `model._currentEngine` without re-rendering the row,
       // so the render-time `primaryEngine`/`modelId` may be stale — reading them
       // here would silently revert the selection to the pre-cycle engine.
-      const clickEngine = (model._currentEngine || availableBackends[0])
+      const clickEngine = (model._currentEngine || _defaultBackend(availableBackends, state.hardware?.ram_gb))
         .toLowerCase().replace("llama.cpp", "gguf");
       const clickModelId = _deriveModelId(model, clickEngine);
       state.selectedModel = {

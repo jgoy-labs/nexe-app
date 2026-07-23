@@ -343,7 +343,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api/v1/chat",
+                        url: "http://127.0.0.1:8000/admin/system/health",
                         method: "GET",
                     },
                 })
@@ -355,7 +355,9 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api/v1/chat",
+                        // WSA-001: path must be in the allowlist; the method/
+                        // body rules are orthogonal to the path rules.
+                        url: "http://127.0.0.1:8000/ui/save",
                         method: "POST",
                         body: JSON.stringify({ prompt: "hello" }),
                     },
@@ -440,11 +442,13 @@ describe("Isolation filter", () => {
         });
 
         it("rejects invalid method", () => {
+            // WSA-001: URL uses an allowlisted path so the failure below is
+            // attributable to the METHOD check, not the path allowlist.
             expect(() =>
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api",
+                        url: "http://127.0.0.1:8000/ui/",
                         method: "TRACE",
                     },
                 })
@@ -453,7 +457,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api",
+                        url: "http://127.0.0.1:8000/ui/",
                         method: "CONNECT",
                     },
                 })
@@ -465,7 +469,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api",
+                        url: "http://127.0.0.1:8000/ui/",
                         method: "GET",
                         body: "ignored",
                     },
@@ -479,7 +483,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api",
+                        url: "http://127.0.0.1:8000/ui/",
                         method: "POST",
                         body: bigBody,
                     },
@@ -567,7 +571,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:8000/api/v1/chat",
+                        url: "http://127.0.0.1:8000/admin/system/health",
                         method: "GET",
                     },
                 })
@@ -577,7 +581,7 @@ describe("Isolation filter", () => {
                 win.__TAURI_ISOLATION_HOOK__({
                     cmd: "fetch_from_sidecar",
                     payload: {
-                        url: "http://127.0.0.1:9876/api?foo=1",
+                        url: "http://127.0.0.1:9876/ui/?foo=1",
                         method: "POST",
                         body: "{}",
                     },
@@ -651,6 +655,81 @@ describe("Isolation filter", () => {
                     },
                 })
             ).toThrow(/sidecar/);
+        });
+
+        // ─────────────────────────────────────────────────────────────────
+        // WSA-001 (2026-07-12) — path allowlist, mirroring the Rust guard
+        // (auth.rs SIDECAR_ALLOWED_PATH_PREFIXES). Default-deny: only the
+        // splash health poll and the /ui/ probe may cross the proxy.
+        // ─────────────────────────────────────────────────────────────────
+
+        function fetchPath(path, method = "GET") {
+            return () =>
+                win.__TAURI_ISOLATION_HOOK__({
+                    cmd: "fetch_from_sidecar",
+                    payload: { url: "http://127.0.0.1:8000" + path, method },
+                });
+        }
+
+        it("WSA-001 allows the two enumerated frontend surfaces", () => {
+            const allowed = [
+                "/admin/system/health",
+                "/admin/system/health/",
+                "/ui",
+                "/ui/",
+                "/ui/index.html",
+                "/UI/index.html", // case-insensitive like the Rust guard
+                "/ui/assets/app.js?v=123",
+            ];
+            for (const path of allowed) {
+                expect(fetchPath(path), `path ${path} must pass`).not.toThrow();
+            }
+        });
+
+        it("WSA-001 default-denies every unlisted path", () => {
+            const blocked = [
+                "/",
+                "/api/v1/chat",
+                "/api/v1/knowledge/search",
+                "/api/v1/memory/query",
+                "/admin/system/shutdown",
+                "/admin/system/restart",
+                "/installer/finalize", // wizard uses direct fetch(), never the proxy
+                "/health/ready",
+            ];
+            for (const path of blocked) {
+                expect(fetchPath(path), `path ${path} must be blocked`).toThrow(
+                    /allowlist/
+                );
+            }
+        });
+
+        it("WSA-001 respects segment boundaries (no /uix over-allow)", () => {
+            const blocked = ["/uix", "/ui2/index.html", "/admin/system/healthz"];
+            for (const path of blocked) {
+                expect(fetchPath(path), `path ${path} must be blocked`).toThrow(
+                    /allowlist/
+                );
+            }
+        });
+
+        it("WSA-001 blocks dot-segment escapes out of /ui/", () => {
+            const blocked = [
+                "/ui/../admin/system/shutdown",
+                "/ui/../api/v1/chat",
+                "/ui/..",
+                "/ui/x/../../api/v1/memory/query",
+            ];
+            for (const path of blocked) {
+                expect(fetchPath(path), `path ${path} must be blocked`).toThrow();
+            }
+        });
+
+        it("WSA-001 does not over-block spellings resolving to allowed paths", () => {
+            const allowed = ["/ui/../ui/x", "/ui/./index.html", "//ui/index.html"];
+            for (const path of allowed) {
+                expect(fetchPath(path), `path ${path} must pass`).not.toThrow();
+            }
         });
     });
 });

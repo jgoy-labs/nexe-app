@@ -154,8 +154,46 @@ export function showError(text) {
   if (spinner) spinner.style.display = "none";
 }
 
+// WSH-005: timeout error with a retry affordance. Shown when Rust's health
+// poll gives up (sidecar-timeout event) — the sidecar never became healthy,
+// so instead of a dead splash the user gets the error plus a button that
+// restarts the sidecar (invoke goes through the isolation allowlist) and
+// reloads the splash to re-enter the normal poll flow.
+export function showTimeoutError(seconds) {
+  const secs = typeof seconds === "number" ? seconds : HEALTH_TIMEOUT_MS / 1000;
+  showError(`El servidor no ha respost en ${secs}s.`);
+  const el = document.querySelector("#splash-error");
+  if (!el || typeof document.createElement !== "function") return;
+  const btn = document.createElement("button");
+  btn.id = "splash-retry";
+  btn.textContent = "Reintenta";
+  btn.style.cssText =
+    "display:block;margin:1rem auto 0;padding:.5rem 1.25rem;font:inherit;cursor:pointer";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Reiniciant…";
+    try {
+      await invoke("restart_sidecar");
+      window.location.reload();
+    } catch (err) {
+      // showError wipes the element's children (textContent) — restore the
+      // button after it so the user can retry again.
+      showError(`No s'ha pogut reiniciar el servidor: ${err}`);
+      btn.disabled = false;
+      btn.textContent = "Reintenta";
+      el.appendChild(btn);
+    }
+  });
+  el.appendChild(btn);
+}
+
 window.addEventListener("DOMContentLoaded", async () => {
   try {
+    // Finding B (uninstall): the tray "Uninstall…" item opens a DEDICATED Tauri
+    // window (uninstall.html) rather than emitting an event to this webview —
+    // after onboarding this page navigates away to the sidecar UI, so an event
+    // listener here would be dead. Nothing to wire on the splash side anymore.
+
     // Show onboarding wizard on first run before sidecar polling.
     const firstRun = await invoke("check_first_run");
     if (firstRun) {
@@ -180,12 +218,27 @@ window.addEventListener("DOMContentLoaded", async () => {
       if (event?.payload) pendingNavUrl = event.payload;
     });
 
+    // WSH-005: Rust's health poll gave up (HEALTH_POLL_TIMEOUT_SECS = 120s).
+    // It no longer navigates on timeout (that landed on connection-refused);
+    // instead it emits this event so we surface the error + retry button
+    // immediately. Our own HEALTH_TIMEOUT_MS (120s too, started at
+    // DOMContentLoaded — slightly later than the Rust task) stays as the
+    // fallback if the event is lost.
+    let rustTimedOut = false;
+    await listen("sidecar-timeout", (event) => {
+      rustTimedOut = true;
+      showTimeoutError(event?.payload);
+    });
+
     const port = await getSidecarPort();
     const healthUrl = `http://127.0.0.1:${port}/admin/system/health`;
     const deadline = Date.now() + HEALTH_TIMEOUT_MS;
     let elapsed = 0;
 
     while (Date.now() < deadline) {
+      // WSH-005: the sidecar-timeout handler already showed the error +
+      // retry button — stop polling so a later iteration cannot overwrite it.
+      if (rustTimedOut) return;
       const secs = Math.round(elapsed / 1000);
       setStatus(secs > 0 ? `iniciant… (${secs}s)` : "iniciant…");
       try {
@@ -240,6 +293,7 @@ window.addEventListener("DOMContentLoaded", async () => {
       elapsed += HEALTH_POLL_MS;
     }
 
+    if (rustTimedOut) return; // error + retry already on screen (WSH-005)
     showError(`El servidor no ha respost en ${HEALTH_TIMEOUT_MS / 1000}s.`);
   } catch (err) {
     showError(`Failed to start: ${err}`);

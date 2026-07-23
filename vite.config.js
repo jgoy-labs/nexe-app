@@ -1,4 +1,11 @@
 import { defineConfig } from "vite";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// ESM has no __dirname; derive it from import.meta.url. Points at the project
+// root (where this config lives), so the multi-page HTML inputs below resolve
+// regardless of the process cwd.
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -24,6 +31,18 @@ export default defineConfig(() => ({
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     // C65: SRI via post-build script (scripts/add-sri-to-dist.js).
     // Integrated in package.json "build": "vite build && node scripts/add-sri-to-dist.js"
+
+    // Multi-page (Finding B): the splash/onboarding app (index.html) PLUS the
+    // dedicated uninstall dialog window (uninstall.html, opened by the tray).
+    // Both are HTML entries so Vite emits dist/index.html + dist/uninstall.html
+    // with a shared assets/ chunk graph. Paths are absolute (root is "src", so a
+    // bare "index.html" would still work, but absolute is unambiguous).
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, "src/index.html"),
+        uninstall: resolve(__dirname, "src/uninstall.html"),
+      },
+    },
   },
 
   clearScreen: false,

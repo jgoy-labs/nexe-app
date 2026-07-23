@@ -410,16 +410,104 @@ if [ -n "${APP_SOURCE_DIR:-}" ]; then
     # IMPORTANT 2: Step 4.5 runs BEFORE the PBS copy (Step 5.5), so
     # python-runtime/ does NOT yet exist in the bundle. We do NOT set PYTHONHOME —
     # we let the venv use its natural PBS (uv default).
+    # IMPORTANT 3: seed the **int8** ONNX variant, not the FP32 one.
+    # A bare TextEmbedding(...) downloads onnx/model.onnx (FP32, ~1.0 GB) and
+    # holds ~1.5 GB resident per session. installer/build-embedding-bundle.sh
+    # settled on int8 back in May (266 MB, ~810 MB resident) but that decision
+    # only ever landed in the legacy server-nexe installer — this Tauri build
+    # kept shipping FP32, which is most of the sidecar's baseline on an 8 GB
+    # machine. Measured gate (360 real ca/es/en chunks, 54 queries): no recall
+    # difference attributable to quantization (McNemar p=1.000 at @1/@3/@5,
+    # Catalan 100% top-1 agreement), -739 MB RSS, -793 MB on disk, ~6% slower
+    # throughput. Technique mirrors build-embedding-bundle.sh exactly.
+    # rc captured explicitly: a trailing `|| echo WARN` would neutralise `set -e`
+    # AND swallow the FATAL exits below, leaving the guards inert — verified.
+    set +e
     PYTHONNOUSERSITE=1 \
       FASTEMBED_STAGING_PATH="$FASTEMBED_STAGING" \
-      "$VENV_PY" -c "import os; from fastembed import TextEmbedding; TextEmbedding('sentence-transformers/paraphrase-multilingual-mpnet-base-v2', cache_dir=os.environ['FASTEMBED_STAGING_PATH'])" \
-      || echo "    WARN: fastembed preseed failed (offline build?) — model will be downloaded at first chat"
+      "$VENV_PY" - <<'PYSEED'
+import os
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+cache_dir = Path(os.environ["FASTEMBED_STAGING_PATH"])
+cache_dir.mkdir(parents=True, exist_ok=True)
+
+# Only the 5 files fastembed needs at runtime; everything else (README,
+# alternative ONNX variants, pytorch weights) would bloat the bundle.
+ALLOW = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "config.json",
+    "onnx/model_quantized.onnx",
+]
+snapshot = Path(snapshot_download(
+    repo_id="Xenova/paraphrase-multilingual-mpnet-base-v2",
+    cache_dir=str(cache_dir),
+    allow_patterns=ALLOW,
+))
+
+# fastembed loads onnx/model.onnx by name, so the int8 variant takes that
+# name. The symlink is renamed; the blob it points at is the int8 weights.
+variant = snapshot / "onnx" / "model_quantized.onnx"
+target = snapshot / "onnx" / "model.onnx"
+if not variant.is_file():
+    listing = sorted(p.name for p in (snapshot / "onnx").iterdir()) if (snapshot / "onnx").is_dir() else []
+    raise SystemExit(f"FATAL: expected {variant} after snapshot_download — found {listing}")
+variant.rename(target)
+
+# fastembed resolves the repo dir in lowercase; snapshot_download writes the
+# repo id's own casing.
+parent = cache_dir
+src = parent / "models--Xenova--paraphrase-multilingual-mpnet-base-v2"
+dst = parent / "models--xenova--paraphrase-multilingual-mpnet-base-v2"
+if src.is_dir() and not dst.is_dir():
+    src.rename(dst)
+
+size_mb = target.stat().st_size / (1024 * 1024)
+if size_mb > 500:
+    raise SystemExit(f"FATAL: seeded ONNX is {size_mb:.0f} MB — that is the FP32 variant, not int8")
+print(f"    Seeded int8 ONNX ({size_mb:.0f} MB)")
+PYSEED
+    SEED_RC=$?
+    set -e
     END_FE=$(date +%s)
-    if [ -d "$FASTEMBED_STAGING" ] && [ -n "$(ls -A "$FASTEMBED_STAGING" 2>/dev/null)" ]; then
-        FE_SIZE=$(du -sh "$FASTEMBED_STAGING" | cut -f1)
-        echo "    Pre-seed completed in $((END_FE - START_FE))s ($FE_SIZE)"
+    [ "$SEED_RC" -ne 0 ] && echo "    WARN: fastembed preseed exited $SEED_RC"
+
+    # Hard gate, mirroring installer/build-embedding-bundle.sh. The old check
+    # was `-d` + `ls -A`, but `mkdir -p` above already created the directory, so
+    # a truncated download (just .locks/ and *.incomplete) passed for good. That
+    # matters more than it looks: the runtime forces HF_HUB_OFFLINE=1
+    # (server-nexe core/lifespan.py), so a bundle without the ONNX ships with a
+    # dead RAG and no way to recover — the old "model will be downloaded at
+    # first chat" message was simply false.
+    SEEDED_ONNX=$(find -L "$FASTEMBED_STAGING" -name 'model.onnx' -type f 2>/dev/null | head -1)
+    if [ -z "$SEEDED_ONNX" ]; then
+        if [ "${NEXE_ALLOW_MISSING_EMBEDDER:-0}" = "1" ]; then
+            echo "    WARN: no embedder seeded — NEXE_ALLOW_MISSING_EMBEDDER=1, RAG will be dead at runtime"
+        else
+            echo "    FATAL: no model.onnx under $FASTEMBED_STAGING — the bundle would ship a dead RAG." >&2
+            echo "           Set NEXE_ALLOW_MISSING_EMBEDDER=1 only if you really want that." >&2
+            exit 1
+        fi
     else
-        echo "    Pre-seed dir empty (offline build) — bundle ships without embedder cache"
+        ONNX_BYTES=$(wc -c < "$SEEDED_ONNX" | tr -d ' ')
+        ONNX_MB=$((ONNX_BYTES / 1024 / 1024))
+        # int8 is ~266 MB. Under 200 = truncated; over 500 = the FP32 variant
+        # slipped back in, which is the whole regression this change undoes.
+        if [ "$ONNX_MB" -lt 200 ] || [ "$ONNX_MB" -gt 500 ]; then
+            echo "    FATAL: seeded ONNX is ${ONNX_MB} MB, expected ~266 MB (int8)." >&2
+            echo "           Under 200 MB = truncated download; over 500 MB = FP32 variant." >&2
+            exit 1
+        fi
+        # Identity of what we seeded, so the launcher can tell "already seeded"
+        # from "seeded with something else". Computed once here; comparing it at
+        # launch costs a file read instead of hashing 266 MB every start.
+        ONNX_SHA=$(shasum -a 256 "$SEEDED_ONNX" | cut -c1-16)
+        printf 'xenova-mpnet-int8:%s\n' "$ONNX_SHA" > "$FASTEMBED_STAGING/.nexe-embedder-id"
+        FE_SIZE=$(du -sh "$FASTEMBED_STAGING" | cut -f1)
+        echo "    Pre-seed completed in $((END_FE - START_FE))s ($FE_SIZE, model.onnx ${ONNX_MB} MB int8, id ${ONNX_SHA})"
     fi
 fi
 
@@ -455,12 +543,32 @@ export PYTHONUNBUFFERED=1
 # copy to the user cache (writable) only on first launch. Reproduces the
 # logic of installer/installer_setup_env.py:_seed_fastembed_cache().
 # Empirically validated 2026-05-20 (Option B).
-EMBEDDER_DIR="$HOME/.cache/fastembed/models--sentence-transformers--paraphrase-multilingual-mpnet-base-v2"
-if [ -d "$SIDECAR_DIR/app/.fastembed_cache" ] && [ ! -d "$EMBEDDER_DIR" ]; then
-    echo "First launch: seeding fastembed cache to ~/.cache/fastembed/..." >&2
-    mkdir -p "$HOME/.cache/fastembed"
-    cp -R "$SIDECAR_DIR/app/.fastembed_cache/." "$HOME/.cache/fastembed/" 2>/dev/null || \
-        echo "WARN: fastembed seed failed (will download at first chat)" >&2
+# The guard used to test for `models--sentence-transformers--<model>`, but
+# fastembed materialises the cache under `models--xenova--<model>` (the ONNX
+# mirror it actually downloads from). That directory therefore never existed,
+# the condition was always true, and this re-copied ~1 GB on EVERY launch
+# instead of only the first — measurable as a stall at every start on a small
+# machine. Guard on a sentinel we write ourselves: unlike a hard-coded repo
+# name it cannot silently desync if upstream renames the mirror again.
+# The sentinel carries the IDENTITY of what was seeded, not just "something was".
+# A bare existence check makes the seed a one-shot for the life of the machine:
+# once any build has seeded, a later build shipping a different embedder would
+# never install it, and the user would keep running the old one with nothing in
+# the logs to say so. Comparing content re-seeds exactly when the bundle differs.
+SEED_SENTINEL="$HOME/.cache/fastembed/.nexe-seeded"
+SEED_SRC="$SIDECAR_DIR/app/.fastembed_cache"
+if [ -d "$SEED_SRC" ]; then
+    WANT_ID=$(cat "$SEED_SRC/.nexe-embedder-id" 2>/dev/null || echo "unknown")
+    HAVE_ID=$(cat "$SEED_SENTINEL" 2>/dev/null || echo "none")
+    if [ "$WANT_ID" != "$HAVE_ID" ]; then
+        echo "Seeding fastembed cache to ~/.cache/fastembed/ (have=$HAVE_ID want=$WANT_ID)..." >&2
+        mkdir -p "$HOME/.cache/fastembed"
+        if cp -R "$SEED_SRC/." "$HOME/.cache/fastembed/" 2>/dev/null; then
+            printf '%s\n' "$WANT_ID" > "$SEED_SENTINEL"
+        else
+            echo "WARN: fastembed seed failed (will download at first chat)" >&2
+        fi
+    fi
 fi
 
 # Read auth token from stdin (NOT env var) so it never appears in

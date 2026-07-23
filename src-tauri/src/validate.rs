@@ -231,6 +231,144 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
+
+    // --- BONUS-001: property / fuzz coverage of the security validators ---
+    // The existing tests above only exercise fixed literals. These add a
+    // generative layer (encoding / normalisation / traversal bypasses) so the
+    // security boundary is pinned against future drift. Deterministic PRNG keeps
+    // it reproducible without a proptest/quickcheck dev-dependency.
+
+    /// Tiny reproducible LCG (SplitMix-style constants) — no external crate.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+    }
+
+    /// Reference oracle mirroring the *documented* contract of `validate_plugin_id`:
+    /// 2..=64 chars, lowercase ASCII alnum + `-`/`_`, never a Windows reserved name.
+    fn reference_valid_id(id: &str) -> bool {
+        (2..=64).contains(&id.len())
+            && id
+                .chars()
+                .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_'))
+            && !WINDOWS_RESERVED_NAMES.contains(&id)
+    }
+
+    /// Property: `validate_plugin_id` agrees with its documented contract for a
+    /// large corpus of random strings drawn from a charset that mixes accepted
+    /// and rejected bytes (uppercase, dot, slash, backslash, space, `%`, NUL).
+    #[test]
+    fn prop_validate_plugin_id_matches_contract() {
+        const CHARSET: &[u8] = b"abcdefghijklmnoprstuvz0123456789-_ABCNULPT./ \\%\0";
+        let mut lcg = Lcg(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let len = (lcg.next_u32() % 68) as usize; // spans the 2..=64 boundary
+            let s: String = (0..len)
+                .map(|_| CHARSET[(lcg.next_u32() as usize) % CHARSET.len()] as char)
+                .collect();
+            assert_eq!(
+                validate_plugin_id(&s),
+                reference_valid_id(&s),
+                "validate_plugin_id disagreed with contract for {s:?}"
+            );
+        }
+    }
+
+    /// Every known encoding / normalisation / traversal bypass must be rejected.
+    #[test]
+    fn prop_validate_plugin_id_rejects_known_bypasses() {
+        let long = "a".repeat(65);
+        let bypasses: [&str; 18] = [
+            "RAG",              // uppercase
+            "my.plugin",        // dot
+            "my/plugin",        // unix separator
+            "my\\plugin",       // windows separator
+            "my plugin",        // space
+            "../escape",        // traversal
+            "..\\escape",       // windows traversal
+            "plug\0in",         // embedded NUL
+            "café",             // non-ascii
+            "\u{2024}\u{2024}", // one-dot-leader (dot look-alike)
+            "\u{ff0e}\u{ff0e}", // fullwidth full stop (dot look-alike)
+            "%2e%2e",           // percent-encoded dots (must NOT be decoded here)
+            "con",              // reserved
+            "COM1",             // reserved + uppercase
+            "nul",              // reserved
+            "a",                // too short
+            "",                 // empty
+            long.as_str(),      // too long
+        ];
+        for s in bypasses {
+            assert!(!validate_plugin_id(s), "should have rejected {s:?}");
+        }
+    }
+
+    /// Property: `resolve_plugin_path` NEVER returns a path outside the plugin's
+    /// canonical `ui/` root — for a fixed adversarial corpus and a fuzz stream of
+    /// traversal-prone random paths. The only allowed outcomes are `Ok(p)` with
+    /// `p` inside the ui root, or `Err(_)`.
+    #[test]
+    fn prop_resolve_plugin_path_never_escapes_ui_root() {
+        let root =
+            std::env::temp_dir().join(format!("nexe-validate-prop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let ui = root.join("plug/ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), "ok").unwrap();
+        std::fs::write(root.join("plug/secret.txt"), "secret").unwrap();
+        std::fs::write(root.join("outside.txt"), "secret").unwrap();
+        let canon_ui = ui.canonicalize().unwrap();
+
+        let check = |p: &str| match resolve_plugin_path(&root, "plug", p) {
+            Ok(path) => assert!(
+                path.starts_with(&canon_ui),
+                "resolve_plugin_path escaped ui root for {p:?}: {}",
+                path.display()
+            ),
+            Err(_) => {}
+        };
+
+        // Fixed adversarial corpus: traversal, encoding, normalisation bypasses.
+        let corpus = [
+            "/../secret.txt",
+            "/../../outside.txt",
+            "/..%2fsecret.txt",
+            "/%2e%2e/secret.txt",
+            "/....//secret.txt",
+            "/..\\secret.txt",
+            "/./../secret.txt",
+            "/index.html/../../secret.txt",
+            "//etc/passwd",
+            "/%00index.html",
+            "/ui/../../secret.txt",
+            "/\u{2024}\u{2024}/secret.txt",
+            "/\u{ff0e}\u{ff0e}/secret.txt",
+            "/index.html", // positive control: resolves inside the ui root
+        ];
+        for p in corpus {
+            check(p);
+        }
+
+        // Fuzz: random URI paths built from traversal-prone bytes.
+        const CHARSET: &[u8] = b"abcABC012./\\%.-_ ";
+        let mut lcg = Lcg(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..5_000 {
+            let len = (lcg.next_u32() % 24) as usize;
+            let mut s = String::from("/");
+            for _ in 0..len {
+                s.push(CHARSET[(lcg.next_u32() as usize) % CHARSET.len()] as char);
+            }
+            check(&s);
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
 
 // Plugin root resolver with dev/release split (avoids baking builder's FS path into the release binary).

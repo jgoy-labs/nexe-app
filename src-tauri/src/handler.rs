@@ -193,12 +193,12 @@ pub(crate) fn plugin_protocol_handler<R: Runtime>(
         return finish_with_timing(err_response(400, b"missing plugin id"), started);
     }
 
-    // C06 (2026-04-21): per-plugin rate-limiting is applied PRE-QUEUE
+    // C06 (2026-04-21): per-plugin + global rate-limiting is applied PRE-QUEUE
     // in `lib.rs` (before the job enters the threadpool queue). Here we do NOT
     // consume a token to avoid double-counting the same legitimate request.
     // Callers invoking `plugin_protocol_handler` directly (tests,
-    // future integrations) must apply `rate_limit_ok_for` beforehand if they
-    // want the equivalent defense.
+    // future integrations) must apply `plugin_rate_limits_ok` beforehand if
+    // they want the equivalent defense (WSC-003).
 
     // C64: allocate path_safe with 200-char truncation to prevent
     // log DoS (arbitrary path can be very long). Only at DEBUG level to

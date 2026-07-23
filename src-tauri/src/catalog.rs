@@ -44,6 +44,47 @@ const FALLBACK_CATALOG: &str = include_str!("../resources/catalog_fallback.json"
 const MANIFEST_URL: &str =
     "https://raw.githubusercontent.com/jgoy-labs/server-nexe/catalog-bootstrap/docs/catalog.json";
 
+/// Cap màxim del cos del manifest remot abans de parsejar-lo (mirall
+/// d'`auth::fetch_from_sidecar`). El catàleg real fa desenes de KB; 4 MiB
+/// és marge de sobres. Sense cap, `resp.json()` bufferitza el cos sencer,
+/// de manera que un endpoint compromès o un MITM podria retornar molts GB
+/// i exhaurir la memòria del procés abans que serde ni arrenqui.
+const MAX_CATALOG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Resultat d'avaluar el cos del manifest remot després d'aplicar el cap.
+/// Qualsevol variant diferent de `Ok` provoca fallback a l'embedat.
+enum ManifestOutcome {
+    /// Manifest vàlid amb almenys un model.
+    Ok(Vec<CatalogModel>),
+    /// Cos vàlid però sense cap model → fallback.
+    Empty,
+    /// Cos que supera el cap de mida (mida real ja llegida) → fallback.
+    TooLarge,
+    /// Error de deserialització → fallback.
+    ParseError,
+}
+
+/// Cert si el `Content-Length` declarat supera el cap: permet descartar
+/// el cos abans de llegir-lo. Si el servidor no declara mida, retorna
+/// `false` i la mida real es comprova després a `evaluate_manifest_body`.
+fn declared_too_large(content_length: Option<u64>) -> bool {
+    content_length.is_some_and(|declared| declared > MAX_CATALOG_BYTES)
+}
+
+/// Avalua el cos ja llegit: aplica el cap sobre la mida REAL (defensa
+/// contra respostes sense `Content-Length` o que menteixin) i, si passa,
+/// el parseja amb `serde_json::from_slice`.
+fn evaluate_manifest_body(bytes: &[u8]) -> ManifestOutcome {
+    if bytes.len() as u64 > MAX_CATALOG_BYTES {
+        return ManifestOutcome::TooLarge;
+    }
+    match serde_json::from_slice::<Vec<CatalogModel>>(bytes) {
+        Ok(models) if !models.is_empty() => ManifestOutcome::Ok(models),
+        Ok(_) => ManifestOutcome::Empty,
+        Err(_) => ManifestOutcome::ParseError,
+    }
+}
+
 /// Return the model catalog for the onboarding wizard.
 ///
 /// Called via `invoke("fetch_catalog")` from the frontend (Step 2).
@@ -59,29 +100,59 @@ pub async fn fetch_catalog() -> Vec<CatalogModel> {
         match client.get(MANIFEST_URL).send().await {
             Ok(resp) => {
                 let status = resp.status();
-                match resp.json::<Vec<CatalogModel>>().await {
-                    Ok(models) if !models.is_empty() => {
-                        tracing::info!(
-                            url = %MANIFEST_URL,
-                            count = models.len(),
-                            "catalog: remote manifest consumed",
-                        );
-                        return models;
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            url = %MANIFEST_URL,
-                            status = %status,
-                            "catalog: remote manifest empty — falling back to embedded",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            url = %MANIFEST_URL,
-                            status = %status,
-                            error = %e,
-                            "catalog: remote manifest deserialise failed — falling back to embedded",
-                        );
+                // OOM guard: descarta pel Content-Length declarat abans de
+                // drenar el cos a memòria.
+                if declared_too_large(resp.content_length()) {
+                    tracing::warn!(
+                        url = %MANIFEST_URL,
+                        status = %status,
+                        content_length = ?resp.content_length(),
+                        cap = MAX_CATALOG_BYTES,
+                        "catalog: remote manifest Content-Length over cap — falling back to embedded",
+                    );
+                } else {
+                    match resp.bytes().await {
+                        Ok(bytes) => match evaluate_manifest_body(&bytes) {
+                            ManifestOutcome::Ok(models) => {
+                                tracing::info!(
+                                    url = %MANIFEST_URL,
+                                    count = models.len(),
+                                    "catalog: remote manifest consumed",
+                                );
+                                return models;
+                            }
+                            ManifestOutcome::TooLarge => {
+                                tracing::warn!(
+                                    url = %MANIFEST_URL,
+                                    status = %status,
+                                    read = bytes.len(),
+                                    cap = MAX_CATALOG_BYTES,
+                                    "catalog: remote manifest body over cap — falling back to embedded",
+                                );
+                            }
+                            ManifestOutcome::Empty => {
+                                tracing::warn!(
+                                    url = %MANIFEST_URL,
+                                    status = %status,
+                                    "catalog: remote manifest empty — falling back to embedded",
+                                );
+                            }
+                            ManifestOutcome::ParseError => {
+                                tracing::warn!(
+                                    url = %MANIFEST_URL,
+                                    status = %status,
+                                    "catalog: remote manifest deserialise failed — falling back to embedded",
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                url = %MANIFEST_URL,
+                                status = %status,
+                                error = %e,
+                                "catalog: remote manifest body read failed — falling back to embedded",
+                            );
+                        }
                     }
                 }
             }
@@ -164,6 +235,76 @@ mod tests {
             models[0].license_url.as_deref(),
             Some("https://example.test/license"),
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Cap de mida del manifest remot (NEXE-APP-WSG-002 / NEXE-APP-WSE-001).
+    // Sense cap, `resp.json()` bufferitzava el cos sencer: un endpoint
+    // compromès/MITM podia retornar molts GB i exhaurir la memòria. El fix
+    // reflecteix `auth::fetch_from_sidecar`: cap per Content-Length + mida
+    // real, i fallback a l'embedat si es passa.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn declared_too_large_rejects_over_cap_content_length() {
+        assert!(
+            declared_too_large(Some(MAX_CATALOG_BYTES + 1)),
+            "un Content-Length per sobre del cap s'ha de rebutjar",
+        );
+    }
+
+    #[test]
+    fn declared_too_large_accepts_at_or_below_cap_and_missing() {
+        assert!(!declared_too_large(Some(MAX_CATALOG_BYTES)));
+        assert!(!declared_too_large(Some(1024)));
+        // Sense Content-Length no es pot decidir aquí; la mida real ho tanca.
+        assert!(!declared_too_large(None));
+    }
+
+    #[test]
+    fn evaluate_manifest_body_rejects_oversize_real_body() {
+        // Cos que menteix o no declara mida però supera el cap: la mida real
+        // el frena abans de serde.
+        let oversize = vec![b' '; (MAX_CATALOG_BYTES + 1) as usize];
+        assert!(
+            matches!(evaluate_manifest_body(&oversize), ManifestOutcome::TooLarge),
+            "un cos real per sobre del cap s'ha de rebutjar sense parsejar",
+        );
+    }
+
+    #[test]
+    fn evaluate_manifest_body_parses_valid_catalog() {
+        let json = br#"[{
+            "name": "Test Model",
+            "params": "4B",
+            "ram_gb": 4.0,
+            "disk_gb": 3.3,
+            "backends": ["MLX"],
+            "flags": [],
+            "origin": "Test",
+            "ollama": "test:4b",
+            "mlx": null,
+            "gguf": null
+        }]"#;
+        match evaluate_manifest_body(json) {
+            ManifestOutcome::Ok(models) => {
+                assert_eq!(models.len(), 1);
+                assert_eq!(models[0].name, "Test Model");
+            }
+            _ => panic!("un manifest vàlid i no buit ha de retornar Ok"),
+        }
+    }
+
+    #[test]
+    fn evaluate_manifest_body_flags_empty_and_parse_error() {
+        assert!(matches!(
+            evaluate_manifest_body(b"[]"),
+            ManifestOutcome::Empty
+        ));
+        assert!(matches!(
+            evaluate_manifest_body(b"{ not json"),
+            ManifestOutcome::ParseError
+        ));
     }
 
     #[test]

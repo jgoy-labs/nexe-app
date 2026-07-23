@@ -85,6 +85,24 @@
         // No payload required.
     };
 
+    // Finding B: selective uninstall driven by the frontend modal. Payload is
+    // { opts: { models, conversations, library, ollama } } — all optional
+    // booleans (Rust has #[serde(default)]). The command is DESTRUCTIVE but
+    // carries its OWN native confirmation gate on the Rust side (WSA-002); this
+    // validator only enforces the payload SHAPE so a malformed/hostile call is
+    // rejected before it reaches the core.
+    ALLOWED.uninstall_with_options = (args) => {
+        const opts = args?.payload?.opts ?? args?.opts;
+        if (opts === undefined || opts === null || typeof opts !== "object" || Array.isArray(opts)) {
+            throw new Error("isolation: uninstall_with_options requires { opts: object }");
+        }
+        for (const key of ["models", "conversations", "library", "ollama"]) {
+            if (opts[key] !== undefined && typeof opts[key] !== "boolean") {
+                throw new Error(`isolation: uninstall_with_options opts.${key} must be boolean`);
+            }
+        }
+    };
+
     // Security C25 (2026-04-21) — Phase 2 Skeleton.
     // fetch_from_sidecar(url, method, body?) — intercepts calls to the server-nexe
     // sidecar and injects the Bearer token on the Rust side. The main webview
@@ -96,6 +114,50 @@
     // B2 (2026-04-21): structural parse via `new URL(...)`
     // (before: `startsWith("http://127.0.0.1:")` bypassed via userinfo).
     // Extracted to validateSidecarUrl + validateBody to reduce CCN.
+
+    // WSA-001 (2026-07-12): path allowlist mirroring the Rust guard
+    // (auth.rs SIDECAR_ALLOWED_PATH_PREFIXES). The proxy runs with the admin
+    // Bearer token, so only the two frontend surfaces main.js actually uses
+    // may pass: the splash health poll and the /ui/ reachability probe.
+    // Defense in depth — Rust re-validates with the same rules.
+    var SIDECAR_ALLOWED_PATH_PREFIXES = ["/admin/system/health", "/ui"];
+
+    // Canonicalise a URL pathname the same way the Rust guard does: rebuild
+    // from segments (drop "" and ".", pop on "..", clamped at root), then
+    // lower-case. `new URL()` already resolves most dot-segments, but we do
+    // not rely on that — the resolved form is what gets matched.
+    function normalizeSidecarPath(pathname) {
+        // WSA-001: percent-decode before splitting so %2f/%2e cannot hide a
+        // /admin escape as /ui/..%2fadmin (parity with the Rust guard).
+        var decoded;
+        try { decoded = decodeURIComponent(pathname); } catch (e) { decoded = pathname; }
+        var segments = [];
+        var parts = decoded.split("/");
+        for (var i = 0; i < parts.length; i++) {
+            var seg = parts[i];
+            if (seg === "" || seg === ".") continue;
+            if (seg === "..") {
+                segments.pop();
+                continue;
+            }
+            segments.push(seg);
+        }
+        return ("/" + segments.join("/")).toLowerCase();
+    }
+
+    // Throws unless the normalised path matches an allowlist entry exactly or
+    // as a directory prefix (prefix itself or prefix + "/..."). Boundary-safe:
+    // "/ui/index.html" passes, "/uix" does not.
+    function validateSidecarPath(pathname) {
+        var normalised = normalizeSidecarPath(pathname);
+        for (var i = 0; i < SIDECAR_ALLOWED_PATH_PREFIXES.length; i++) {
+            var prefix = SIDECAR_ALLOWED_PATH_PREFIXES[i];
+            if (normalised === prefix || normalised.indexOf(prefix + "/") === 0) {
+                return;
+            }
+        }
+        throw new Error("isolation: fetch_from_sidecar path not in allowlist");
+    }
 
     // Validates that the URL points exclusively to the local sidecar (B2 defense).
     // Throws Error if not valid.
@@ -130,6 +192,8 @@
         if (parsed.port === "") {
             throw new Error("isolation: fetch_from_sidecar URL must include explicit port");
         }
+        // WSA-001: path allowlist (pathname excludes query/fragment already).
+        validateSidecarPath(parsed.pathname);
     }
 
     // Validates the HTTP method and, if present, the body. Throws Error if not valid.

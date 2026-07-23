@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Uninstall nexe-app</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; background: #0a0a0a; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <!-- The uninstall modal is built by uninstall-page.js at DOMContentLoaded
+         (this whole window is the dialog). CSP is the global app policy in
+         tauri.conf.json — same as index.html; the module script is 'self'. -->
+    <script type="module" src="/uninstall-page.js"></script>
+  </body>
+</html>

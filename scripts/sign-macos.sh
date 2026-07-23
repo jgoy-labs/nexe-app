@@ -19,6 +19,10 @@
 #   export TAURI_APPLE_TEAM_ID="XXXXXXXXXX"
 #   ./scripts/sign-macos.sh
 #
+# Verification is STRICT by default (WSF-001): spctl/notarization failures
+# abort the build. For pre-notarization inspection runs (no ticket yet):
+#   NEXE_STRICT_SIGNING=0 ./scripts/sign-macos.sh
+#
 # Troubleshooting:
 #   - `security find-identity -v -p codesigning` → view installed certificates
 #   - `xcrun notarytool history --apple-id ... --team-id ...` → review submissions
@@ -70,6 +74,19 @@ export CARGO_INCREMENTAL=0
 CARGO_HOME_VAL="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTFLAGS="--remap-path-prefix=${HOME}=~ --remap-path-prefix=${CARGO_HOME_VAL}=@cargo ${RUSTFLAGS:-}"
 
+# WSF-002: fail-closed vulnerability gate before building the DISTRIBUTED binary.
+# The public DMG is built HERE (locally, not in CI), so a red `cargo audit` must block
+# the release exactly as it blocks the CI pipeline (.github/workflows/{check,release}.yml).
+# Runs in a subshell so it does not disturb the `cd src-tauri` for the build below.
+echo "=== cargo audit (release gate) ==="
+if ! command -v cargo-audit >/dev/null 2>&1; then
+    echo "❌  cargo-audit not installed — required to gate the public release." >&2
+    echo "    Install with: cargo install cargo-audit --locked" >&2
+    exit 1
+fi
+( cd src-tauri && cargo audit --deny warnings )
+echo ""
+
 echo "=== cargo tauri build --release ==="
 cd src-tauri
 cargo tauri build
@@ -79,12 +96,12 @@ echo "=== Verificacio signatura ==="
 APP="target/release/bundle/macos/nexe-app.app"
 if [[ -d "$APP" ]]; then
     codesign -dvv "$APP" 2>&1 | grep -E "Identifier|TeamIdentifier|Authority|Sealed"
-    # In strict mode (CI / release pipeline) treat a failing
-    # spctl assess as a hard error instead of swallowing the exit code with `||`.
-    # Pre-notarization runs should leave NEXE_STRICT_SIGNING unset (default) so
-    # the warning is informational; the release-pipeline driver sets it to 1
-    # right before notarization so the build fails fast on signing regressions.
-    if [[ "${NEXE_STRICT_SIGNING:-0}" == "1" ]]; then
+    # WSF-001: STRICT per DEFECTE — aquest script només existeix per a
+    # releases públiques (header), així que una fallada d'spctl ha d'abortar.
+    # Per a runs d'inspecció pre-notarització (encara sense ticket), opt-out
+    # explícit: NEXE_STRICT_SIGNING=0. (El "release-pipeline driver" que un
+    # comentari antic citava aquí no ha existit mai.)
+    if [[ "${NEXE_STRICT_SIGNING:-1}" == "1" ]]; then
         spctl --assess --type execute --verbose=4 "$APP" || {
             echo "❌  spctl assess ha fallat (NEXE_STRICT_SIGNING=1) — abortant build"
             exit 1
@@ -112,10 +129,11 @@ if [[ -d "$DMG_DIR" ]]; then
     for DMG in "$DMG_DIR"/*.dmg; do
         [[ -f "$DMG" ]] || continue
         echo "Verificant $(basename "$DMG"):"
-        # B138: in strict mode (release pipeline) a badly notarized DMG must
+        # B138 + WSF-001 (strict per defecte): a badly notarized DMG must
         # stop the build, not just warn — a silent release with an un-notarized
         # DMG would be rejected by Gatekeeper on the user's machine.
-        if [[ "${NEXE_STRICT_SIGNING:-0}" == "1" ]]; then
+        # Opt-out explícit per a inspecció pre-notarització: NEXE_STRICT_SIGNING=0.
+        if [[ "${NEXE_STRICT_SIGNING:-1}" == "1" ]]; then
             spctl -a -t open --context context:primary-signature -v "$DMG" || {
                 echo "❌  $(basename "$DMG") no notaritzat correctament (NEXE_STRICT_SIGNING=1)"
                 DMG_FAIL=1

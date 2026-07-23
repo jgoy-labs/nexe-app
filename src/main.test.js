@@ -352,3 +352,76 @@ describe("sidecar health timeout (B169)", () => {
     expect(mod.HEALTH_TIMEOUT_MS).toBeGreaterThanOrEqual(90_000);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// WSH-005 — splash timeout: error + retry instead of navigating into a
+// connection-refused page. Rust emits `sidecar-timeout`; main.js shows the
+// error with a "Reintenta" button that restarts the sidecar and reloads.
+// ─────────────────────────────────────────────────────────────────────────
+describe("splash timeout retry (WSH-005)", () => {
+  function mkFakeEl(tag = "div") {
+    return {
+      tag,
+      style: {},
+      children: [],
+      listeners: {},
+      textContent: "",
+      appendChild(child) {
+        this.children.push(child);
+      },
+      addEventListener(event, fn) {
+        this.listeners[event] = fn;
+      },
+    };
+  }
+
+  let errEl;
+  beforeEach(() => {
+    errEl = mkFakeEl();
+    errEl.id = "splash-error";
+    globalThis.document = {
+      querySelector: (sel) => (sel === "#splash-error" ? errEl : null),
+      createElement: (tag) => mkFakeEl(tag),
+      body: { appendChild: () => {} },
+    };
+    globalThis.window.location = { reload: vi.fn() };
+  });
+
+  it("shows the timeout message with the seconds from the Rust event", () => {
+    mod.showTimeoutError(120);
+    expect(errEl.textContent).toContain("120s");
+    expect(errEl.style.display).toBe("block");
+  });
+
+  it("falls back to HEALTH_TIMEOUT_MS when the payload is missing", () => {
+    mod.showTimeoutError(undefined);
+    expect(errEl.textContent).toContain(`${mod.HEALTH_TIMEOUT_MS / 1000}s`);
+  });
+
+  it("appends a retry button that restarts the sidecar and reloads", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    invoke.mockClear();
+    mod.showTimeoutError(120);
+    const btn = errEl.children.find((c) => c.id === "splash-retry");
+    expect(btn).toBeDefined();
+    expect(btn.textContent).toBe("Reintenta");
+
+    await btn.listeners.click();
+    expect(invoke).toHaveBeenCalledWith("restart_sidecar");
+    expect(globalThis.window.location.reload).toHaveBeenCalled();
+  });
+
+  it("re-enables the retry button when restart_sidecar fails", async () => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    invoke.mockRejectedValueOnce("SIDECAR_RESTART_FAILED");
+    mod.showTimeoutError(120);
+    const btn = errEl.children.find((c) => c.id === "splash-retry");
+
+    await btn.listeners.click();
+    expect(globalThis.window.location.reload).not.toHaveBeenCalled();
+    expect(btn.disabled).toBe(false);
+    expect(errEl.textContent).toContain("No s'ha pogut reiniciar");
+    // The button is re-appended after showError wiped the children.
+    expect(errEl.children).toContain(btn);
+  });
+});

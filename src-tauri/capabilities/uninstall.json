@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "uninstall",
+  "description": "Capability for the dedicated uninstall window (Finding B). Scoped to the 'uninstall' label only — does NOT widen the main window's surface. Minimal by design (CAP1/CAP2): the page's JS uses ONLY getCurrentWindow().close() → core:window:allow-close, plus core:default for baseline IPC. show()/set_focus() are done Rust-side by the tray (not gated by this capability), and the destructive `uninstall_with_options` is a custom app command (not ACL-gated) whose confirmation is a Rust-side native dialog — so no dialog:allow-message / window show/focus permissions are granted here.",
+  "windows": ["uninstall"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close"
+  ]
+}
