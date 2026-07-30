@@ -452,9 +452,9 @@ fn is_safe_to_remove(path: &Path, home: &Path, owned_bases: &[&Path]) -> bool {
         return true;
     }
     // (3b) containment under a KNOWN, non-empty, non-root base.
-    owned_bases
-        .iter()
-        .any(|base| !base.as_os_str().is_empty() && *base != Path::new("/") && path.starts_with(base))
+    owned_bases.iter().any(|base| {
+        !base.as_os_str().is_empty() && *base != Path::new("/") && path.starts_with(base)
+    })
 }
 
 /// `remove_dir_all` wrapped in [`is_safe_to_remove`]. On a rejected path it does
@@ -529,10 +529,7 @@ fn library_data_dirs(home: &Path) -> Vec<PathBuf> {
     // removed via `data_dir`/`config_dir`.)
     #[cfg(target_os = "windows")]
     {
-        vec![home
-            .join("AppData")
-            .join("Local")
-            .join("com.nexe.app")]
+        vec![home.join("AppData").join("Local").join("com.nexe.app")]
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
@@ -770,7 +767,11 @@ fn delete_keychain_token(report: &mut UninstallReport) {
     // `keyring` backend maps service/username to these attributes). Same
     // clear-then-verify contract as the token above (2026-07-23).
     let _ = timed(&[
-        "clear", "service", "server-nexe", "username", "master-encryption-key",
+        "clear",
+        "service",
+        "server-nexe",
+        "username",
+        "master-encryption-key",
     ]);
     match timed(&[
         "search", "service", "server-nexe", "username", "master-encryption-key",
@@ -785,9 +786,103 @@ fn delete_keychain_token(report: &mut UninstallReport) {
     }
 }
 
-// Windows (Credential Manager via cmdkey) is deferred to its own smoke session —
-// the token still persists there (NEXE-UNINST-C, Windows arm still open).
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Locale-proof presence check over `cmdkey /list:<target>` output.
+///
+/// Two real-world traps, both VM-verified 2026-07-30:
+/// - the NOT-FOUND output echoes the queried name in its localised HEADER
+///   ("Credenciales almacenadas en la actualidad para nexe-hf-token:" +
+///   "* NINGUNO *") — so "stdout contains the target" flags every clean
+///   uninstall as a survivor;
+/// - the ENTRY line prints the stored TargetName either PLAIN
+///   ("Destino: nexe-hf-token" — what `cmdkey /generic:` and CredWrite with a
+///   plain TargetName produce) or with a scheme prefix
+///   ("Target: LegacyGeneric:target=nexe-hf-token") — so requiring `target=`
+///   misses the plain form.
+///
+/// The locale-independent rule: take each line's LAST whitespace token —
+/// present iff it equals the target (plain entry) or ends with
+/// `target=<target>` (prefixed entry). The header never matches (its token
+/// carries a trailing `:`), and a compound credential
+/// (`master-encryption-key@server-nexe`) can never masquerade as its plain
+/// suffix (`server-nexe`). Pure so the contract is unit-tested everywhere.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn cmdkey_stdout_lists_target(stdout: &[u8], target: &str) -> bool {
+    let target = target.to_lowercase();
+    let prefixed = format!("target={target}");
+    String::from_utf8_lossy(stdout)
+        .to_lowercase()
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .any(|token| token == target || token.ends_with(&prefixed))
+}
+
+/// Windows stores the HF token in the Credential Manager via the sidecar's
+/// `keyring` WinVaultKeyring backend: CRED_TYPE_GENERIC with TargetName =
+/// `<service>` and UserName = `<username>` (core/onboarding_state.py:
+/// service `nexe-hf-token`, user `default`; master key: core/crypto/keys.py
+/// service `server-nexe`, user `master-encryption-key`). When a same-service
+/// credential with ANOTHER username pre-existed, WinVaultKeyring re-saves the
+/// old one under the compound TargetName `<username>@<service>` — both
+/// spellings must go. The sidecar is dead at this point, so we shell out to
+/// cmdkey (System32 absolute — PATH is not guaranteed) with the exact
+/// clear-then-verify contract of the Linux secret-tool path above:
+/// `/delete` exit code is deliberately ignored (it lies both ways),
+/// `/list:<target>` decides by STDOUT, each call HARD-timeouted on a worker
+/// thread, CREATE_NO_WINDOW so nothing flashes. A verified survivor is a
+/// failure (B058); an unverifiable removal is a best-effort warn.
+/// NEXE-UNINST-C-WIN (#853), split from NEXE-UNINST-C.
+#[cfg(target_os = "windows")]
+fn delete_keychain_token(report: &mut UninstallReport) {
+    fn timed(args: &[String]) -> Option<std::process::Output> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // same constant as lifecycle.rs:300
+        let cmdkey = std::env::var_os("SystemRoot")
+            .map(|r| {
+                std::path::PathBuf::from(r)
+                    .join("System32")
+                    .join("cmdkey.exe")
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("cmdkey.exe"));
+        let owned: Vec<String> = args.to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = std::process::Command::new(cmdkey)
+                .args(&owned)
+                .stdin(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+            let _ = tx.send(out);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            Ok(Ok(out)) => Some(out),
+            _ => None, // timeout, cmdkey unrunnable, or spawn error → best-effort
+        }
+    }
+
+    // (label for the report, TargetName in the Credential Manager)
+    let targets: [(&str, &str); 4] = [
+        ("hf token", "nexe-hf-token"),
+        ("hf token", "default@nexe-hf-token"),
+        ("master key", "server-nexe"),
+        ("master key", "master-encryption-key@server-nexe"),
+    ];
+    for (label, target) in targets {
+        // Best-effort delete; the /list below is the authority.
+        let _ = timed(&[format!("/delete:{target}")]);
+        match timed(&[format!("/list:{target}")]) {
+            Some(out) if !cmdkey_stdout_lists_target(&out.stdout, target) => {} // gone → OK
+            Some(_) => report.failures.push(format!(
+                "{label}: credential '{target}' still present in Credential Manager after delete"
+            )),
+            None => tracing::warn!(
+                "{label}: could not verify Credential Manager removal of '{target}' (cmdkey unrunnable or unresponsive) — best-effort, it may persist"
+            ),
+        }
+    }
+}
+
+// Other platforms (neither macOS, Linux nor Windows): nothing to clean.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn delete_keychain_token(_report: &mut UninstallReport) {}
 
 /// Human-readable list of what the sweep will remove, shown in the native gate so
@@ -846,7 +941,11 @@ fn uninstall_summary(opts: &UninstallOptions) -> String {
 pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> UninstallOutcome {
     // Nothing selected → no gate, no exit (protects against an empty/malformed
     // IPC payload and a pointless app restart).
-    if !opts.models && !opts.conversations && !opts.library && !opts.ollama && !opts.embeddings_cache
+    if !opts.models
+        && !opts.conversations
+        && !opts.library
+        && !opts.ollama
+        && !opts.embeddings_cache
     {
         return UninstallOutcome {
             failures: Vec::new(),
@@ -910,7 +1009,8 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
     .await
     .unwrap_or_else(|e| {
         let mut r = UninstallReport::default();
-        r.failures.push(format!("uninstall sweep task join error: {e}"));
+        r.failures
+            .push(format!("uninstall sweep task join error: {e}"));
         r
     });
 
@@ -1332,7 +1432,11 @@ mod tests {
         // A derived Library dir passed as an explicit base (WebKit).
         assert!(super::is_safe_to_remove(webkit, home, &bases));
         // The Ollama store — accepted as the EXACT home/.ollama.
-        assert!(super::is_safe_to_remove(&home.join(".ollama"), home, &bases));
+        assert!(super::is_safe_to_remove(
+            &home.join(".ollama"),
+            home,
+            &bases
+        ));
     }
 
     // ── Finding B: selective_reset_paths matrix ───────────────────────────────
@@ -1364,7 +1468,11 @@ mod tests {
         assert!(!data.join("sidecar").join("data").join("models").exists());
         assert!(data.join("sidecar").join("vectors").exists());
         assert!(data.join("sidecar").join("storage").exists());
-        assert!(data.join("sidecar").join("data").join("onboarding.json").exists());
+        assert!(data
+            .join("sidecar")
+            .join("data")
+            .join("onboarding.json")
+            .exists());
         assert!(config.join("onboarding_complete").exists());
     }
 
@@ -1381,7 +1489,11 @@ mod tests {
         assert!(data.join("sidecar").join("data").join("models").exists());
         assert!(!data.join("sidecar").join("vectors").exists());
         assert!(!data.join("sidecar").join("storage").exists());
-        assert!(data.join("sidecar").join("data").join("onboarding.json").exists());
+        assert!(data
+            .join("sidecar")
+            .join("data")
+            .join("onboarding.json")
+            .exists());
     }
 
     #[test]
@@ -1395,7 +1507,10 @@ mod tests {
         let report = super::selective_reset_paths(&config, &data, home.path(), &opts);
         assert!(report.all_ok(), "failures: {:?}", report.failures);
         assert!(!data.exists(), "library wipe removes the whole data dir");
-        assert!(!config.exists(), "library wipe removes the whole config dir");
+        assert!(
+            !config.exists(),
+            "library wipe removes the whole config dir"
+        );
     }
 
     #[test]
@@ -1473,7 +1588,10 @@ mod tests {
         };
         let report = super::selective_reset_paths(&config, &data, home.path(), &opts);
         assert!(report.all_ok(), "failures: {:?}", report.failures);
-        assert!(!fastembed.exists(), "opt-in must remove the fastembed cache");
+        assert!(
+            !fastembed.exists(),
+            "opt-in must remove the fastembed cache"
+        );
         assert!(sibling.exists(), "must not touch other ~/.cache entries");
         assert!(
             data.exists() && config.exists(),
@@ -1607,7 +1725,9 @@ mod tests {
                     p.display()
                 );
             }
-            assert!(files[0].to_string_lossy().ends_with("net.jgoy.nexe-installer.plist"));
+            assert!(files[0]
+                .to_string_lossy()
+                .ends_with("net.jgoy.nexe-installer.plist"));
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -1657,5 +1777,141 @@ mod tests {
         // Idempotent: second run on the already-clean tree reports no failures.
         let report2 = super::selective_reset_paths(&data_dir, &config_dir, home, &opts);
         assert!(report2.all_ok(), "not idempotent: {:?}", report2.failures);
+    }
+
+    // ── #853 (NEXE-UNINST-C-WIN): cmdkey stdout parsing contract ─────────
+    // cmdkey is LOCALISED and its exit codes lie (like secret-tool); the only
+    // reliable signal is whether /list's stdout echoes the target name. These
+    // fixtures are real-shaped outputs (Spanish VM + English) — a parser that
+    // always answers "absent" fails the present-cases and vice versa.
+
+    #[test]
+    fn cmdkey_parser_detects_presence_across_locales() {
+        let es_present = "Credenciales almacenadas en la actualidad:\r\n\r\n\
+             Destino: LegacyGeneric:target=nexe-hf-token\r\n    Tipo: Gen\u{e9}rico\r\n\
+             Usuario: default\r\n"
+            .as_bytes();
+        let en_present = b"Currently stored credentials:\r\n\r\n\
+             Target: LegacyGeneric:target=nexe-hf-token\r\n    Type: Generic\r\n\
+             User: default\r\n";
+        let en_upper = b"    Target: LegacyGeneric:target=NEXE-HF-TOKEN\r\n";
+        assert!(super::cmdkey_stdout_lists_target(
+            es_present,
+            "nexe-hf-token"
+        ));
+        assert!(super::cmdkey_stdout_lists_target(
+            en_present,
+            "nexe-hf-token"
+        ));
+        assert!(
+            super::cmdkey_stdout_lists_target(en_upper, "nexe-hf-token"),
+            "la comparació ha de ser case-insensitive"
+        );
+        let compound = b"    Target: LegacyGeneric:target=master-encryption-key@server-nexe\r\n";
+        assert!(super::cmdkey_stdout_lists_target(
+            compound,
+            "master-encryption-key@server-nexe"
+        ));
+        // Capturat REAL a la VM (sessió interactiva, 30/07): l'entrada d'una
+        // credencial creada amb `cmdkey /generic:` surt PLANA, sense target= —
+        // el tret que va matar el parser v2.
+        let es_plain_present = "Credenciales almacenadas en la actualidad para nexe-hf-token:\r\n\r\n    Destino: nexe-hf-token\r\n    Tipo: Gen\u{e9}rico \r\n    Usuario: default\r\n"
+            .as_bytes();
+        assert!(super::cmdkey_stdout_lists_target(
+            es_plain_present,
+            "nexe-hf-token"
+        ));
+    }
+
+    #[test]
+    fn cmdkey_parser_compound_never_masquerades_as_plain_suffix() {
+        // Si /list:server-nexe llistés també l'entrada composta, la seva línia
+        // acaba amb "…@server-nexe" — NO pot comptar com a presència del
+        // target pla "server-nexe" (ends-with seria un fals positiu).
+        let only_compound = b"    Destino: master-encryption-key@server-nexe\r\n    Usuario: x\r\n";
+        assert!(super::cmdkey_stdout_lists_target(
+            only_compound,
+            "master-encryption-key@server-nexe"
+        ));
+        assert!(!super::cmdkey_stdout_lists_target(
+            only_compound,
+            "server-nexe"
+        ));
+    }
+
+    #[test]
+    fn cmdkey_parser_absent_on_error_messages() {
+        let es_absent = "CMDKEY: No se puede encontrar el elemento.\r\n".as_bytes();
+        let en_absent = b"CMDKEY: Element not found.\r\n";
+        // Capturat REAL a la VM (30/07): el not-found FA ECO del target a la
+        // capçalera localitzada ("…para nexe-hf-token: * NINGUNO *") — el tret
+        // que va matar el parser v1 (hauria marcat cada uninstall net com a
+        // supervivent). La presència real només la marca la línia `target=`.
+        let es_echo_absent =
+            "Credenciales almacenadas en la actualidad para nexe-hf-token:\r\n\r\n* NINGUNO *\r\n"
+                .as_bytes();
+        let en_echo_absent = b"Currently stored credentials for nexe-hf-token:\r\n\r\n* NONE *\r\n";
+        let es_none =
+            "Credenciales almacenadas en la actualidad:\r\n\r\n* NINGUNO *\r\n".as_bytes();
+        let empty = b"";
+        for out in [
+            es_absent,
+            en_absent,
+            es_echo_absent,
+            en_echo_absent,
+            es_none,
+            empty,
+        ] {
+            assert!(
+                !super::cmdkey_stdout_lists_target(out, "nexe-hf-token"),
+                "cap variant not-found pot semblar presència: {:?}",
+                String::from_utf8_lossy(out)
+            );
+        }
+    }
+
+    /// Gate empíric del #853 a la VM Windows ARM64 — executa explícitament:
+    /// `cargo test -- --ignored cmdkey_roundtrip`. Sembra una credencial REAL,
+    /// verifica presència (mutation-control del parser en viu), passa pel codi
+    /// de PRODUCCIÓ i verifica absència + report net.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "toca el Credential Manager real — gate de VM per a #853"]
+    fn cmdkey_roundtrip_real_credential() {
+        use std::process::Command;
+
+        let seed = Command::new("cmdkey")
+            .args([
+                "/generic:nexe-hf-token",
+                "/user:default",
+                "/pass:dummy-secret-853",
+            ])
+            .output()
+            .expect("cmdkey /generic ha de poder executar-se");
+        assert!(seed.status.success(), "seed: {:?}", seed);
+
+        let listed = Command::new("cmdkey")
+            .args(["/list:nexe-hf-token"])
+            .output()
+            .expect("cmdkey /list");
+        assert!(
+            super::cmdkey_stdout_lists_target(&listed.stdout, "nexe-hf-token"),
+            "mutation-control: la credencial sembrada s'ha de VEURE abans del delete: {}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+
+        let mut report = super::UninstallReport::default();
+        super::delete_keychain_token(&mut report);
+        assert!(report.all_ok(), "failures: {:?}", report.failures);
+
+        let after = Command::new("cmdkey")
+            .args(["/list:nexe-hf-token"])
+            .output()
+            .expect("cmdkey /list post-delete");
+        assert!(
+            !super::cmdkey_stdout_lists_target(&after.stdout, "nexe-hf-token"),
+            "la credencial ha sobreviscut al delete: {}",
+            String::from_utf8_lossy(&after.stdout)
+        );
     }
 }

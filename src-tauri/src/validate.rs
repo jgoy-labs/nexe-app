@@ -315,8 +315,7 @@ mod tests {
     /// `p` inside the ui root, or `Err(_)`.
     #[test]
     fn prop_resolve_plugin_path_never_escapes_ui_root() {
-        let root =
-            std::env::temp_dir().join(format!("nexe-validate-prop-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("nexe-validate-prop-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let ui = root.join("plug/ui");
         std::fs::create_dir_all(&ui).unwrap();

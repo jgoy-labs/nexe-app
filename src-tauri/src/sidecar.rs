@@ -96,8 +96,7 @@ impl Drop for RestartGuard {
 // ─── Runtime supervisor (WSH-001) ─────────────────────────────────────────────
 
 /// How often the supervisor probes the sidecar's liveness.
-pub(crate) const SUPERVISOR_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(3);
+pub(crate) const SUPERVISOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Consecutive HTTP health-check failures before a STILL-RUNNING sidecar is
 /// treated as dead (covers a hung/unresponsive process, not just a crashed one).
@@ -559,14 +558,26 @@ mod tests {
     /// is dead AND neither shutting down nor already restarting.
     #[test]
     fn should_restart_only_when_dead_and_unguarded() {
-        assert!(should_restart(true, false, false), "dead + no guards → restart");
-        assert!(!should_restart(false, false, false), "alive → never restart");
-        assert!(!should_restart(true, true, false), "shutting down → never restart");
+        assert!(
+            should_restart(true, false, false),
+            "dead + no guards → restart"
+        );
+        assert!(
+            !should_restart(false, false, false),
+            "alive → never restart"
+        );
+        assert!(
+            !should_restart(true, true, false),
+            "shutting down → never restart"
+        );
         assert!(
             !should_restart(true, false, true),
             "restart in progress → never restart"
         );
-        assert!(!should_restart(false, true, true), "alive + guards → never restart");
+        assert!(
+            !should_restart(false, true, true),
+            "alive + guards → never restart"
+        );
     }
 
     /// `sidecar_dead`: a crash always counts; a hang counts ONLY after the sidecar
@@ -664,6 +675,9 @@ mod tests {
         );
         // `None`-slot short-circuit: lifecycle owns it → never "exited".
         let empty: Mutex<Option<std::process::Child>> = Mutex::new(None);
-        assert!(!child_has_exited(&empty), "empty slot must report not-exited");
+        assert!(
+            !child_has_exited(&empty),
+            "empty slot must report not-exited"
+        );
     }
 }

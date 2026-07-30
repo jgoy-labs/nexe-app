@@ -267,8 +267,8 @@ fn seed_fastembed_cache(sidecar_dir: &Path) {
     if !src.is_dir() {
         return;
     }
-    let want_id = std::fs::read_to_string(src.join(".nexe-embedder-id"))
-        .unwrap_or_else(|_| "unknown".into());
+    let want_id =
+        std::fs::read_to_string(src.join(".nexe-embedder-id")).unwrap_or_else(|_| "unknown".into());
     let have_id = std::fs::read_to_string(&sentinel).unwrap_or_default();
     if want_id.trim() == have_id.trim() && !have_id.trim().is_empty() {
         return;
@@ -769,7 +769,9 @@ async fn poll_sidecar_health(
             if let Some(w) = app_handle.get_webview_window("main") {
                 match w.emit("sidecar-timeout", HEALTH_POLL_TIMEOUT_SECS) {
                     Ok(()) => tracing::info!(port, "splash: emitted sidecar-timeout to splash JS"),
-                    Err(e) => tracing::error!(error = %e, port, "splash: emit sidecar-timeout failed"),
+                    Err(e) => {
+                        tracing::error!(error = %e, port, "splash: emit sidecar-timeout failed")
+                    }
                 }
             }
             return;
@@ -814,10 +816,10 @@ async fn poll_sidecar_health(
             match ui_url.parse() {
                 Ok(url) => {
                     let nav_window = w.clone();
-                    if let Err(e) = w.run_on_main_thread(move || {
-                        match nav_window.navigate(url) {
-                            Ok(()) => tracing::info!(port, "splash: navigated webview to sidecar UI"),
-                            Err(e) => tracing::error!(error = %e, port, "splash: webview navigate failed"),
+                    if let Err(e) = w.run_on_main_thread(move || match nav_window.navigate(url) {
+                        Ok(()) => tracing::info!(port, "splash: navigated webview to sidecar UI"),
+                        Err(e) => {
+                            tracing::error!(error = %e, port, "splash: webview navigate failed")
                         }
                     }) {
                         tracing::error!(error = %e, port, "splash: run_on_main_thread failed");
@@ -1136,7 +1138,11 @@ async fn respawn_same_port(app: tauri::AppHandle) -> Result<(), String> {
             crate::sidecar::RESPAWN_HEALTH_TIMEOUT_SECS
         ));
     }
-    tracing::info!(new_pid, port, "supervisor: sidecar respawned on same port, healthy");
+    tracing::info!(
+        new_pid,
+        port,
+        "supervisor: sidecar respawned on same port, healthy"
+    );
     Ok(())
 }
 
@@ -1517,7 +1523,9 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
                         let _ = open_in_system(&path);
                     }
                 } else {
-                    tracing::warn!("open_sidecar_log: SidecarLogPath state not registered (dev mode?)");
+                    tracing::warn!(
+                        "open_sidecar_log: SidecarLogPath state not registered (dev mode?)"
+                    );
                 }
             }
             "open_logs_folder" => {
@@ -1529,7 +1537,9 @@ fn build_tray_menu(app: &mut tauri::App) -> tauri::Result<()> {
                     // B170: symmetric to open_sidecar_log — in dev mode SidecarLogPath
                     // is not registered, so both tray items are no-ops; warn instead of
                     // failing silently.
-                    tracing::warn!("open_logs_folder: SidecarLogPath state not registered (dev mode?)");
+                    tracing::warn!(
+                        "open_logs_folder: SidecarLogPath state not registered (dev mode?)"
+                    );
                 }
             }
             "uninstall" => {
@@ -3247,9 +3257,13 @@ mod tests {
     fn external_url_allows_allowlisted_hosts_and_subdomains() {
         assert!(is_allowed_external_url("https://server-nexe.com"));
         assert!(is_allowed_external_url("http://server-nexe.com"));
-        assert!(is_allowed_external_url("https://server-nexe.com/trajectoria"));
+        assert!(is_allowed_external_url(
+            "https://server-nexe.com/trajectoria"
+        ));
         assert!(is_allowed_external_url("https://docs.server-nexe.com/x"));
-        assert!(is_allowed_external_url("https://huggingface.co/settings/tokens"));
+        assert!(is_allowed_external_url(
+            "https://huggingface.co/settings/tokens"
+        ));
         // host comparison is case-insensitive
         assert!(is_allowed_external_url("https://SERVER-NEXE.COM/x"));
     }
@@ -3259,7 +3273,9 @@ mod tests {
         // Foreign origin — the core phishing vector the prefix check allowed.
         assert!(!is_allowed_external_url("https://evil.example/phish"));
         // Suffix / lookalike tricks must NOT match the allowlist.
-        assert!(!is_allowed_external_url("https://server-nexe.com.evil.com/x"));
+        assert!(!is_allowed_external_url(
+            "https://server-nexe.com.evil.com/x"
+        ));
         assert!(!is_allowed_external_url("https://evilserver-nexe.com/x"));
         assert!(!is_allowed_external_url("https://notserver-nexe.com"));
         // Non-http(s) schemes.

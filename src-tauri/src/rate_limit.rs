@@ -195,9 +195,8 @@ mod tests {
         // its 1000/s refill makes exact-drain assertions flaky).
         let global_key = "test-independent/global";
         let global_cap = 5u64;
-        let combined = |id: &str| {
-            rate_limit_ok_for(id) && rate_limit_ok_with_capacity(global_key, global_cap)
-        };
+        let combined =
+            |id: &str| rate_limit_ok_for(id) && rate_limit_ok_with_capacity(global_key, global_cap);
 
         // Each request uses a FRESH id, so the per-id bucket always passes
         // (first request always allowed) — only the global can say no.

@@ -573,8 +573,7 @@ mod tests {
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
         use std::io::Write;
-        let mut enc =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(bytes).unwrap();
         enc.finish().unwrap()
     }
