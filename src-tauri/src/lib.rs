@@ -23,6 +23,8 @@ pub mod onboarding_cmd;
 pub mod rate_limit;
 pub mod sidecar;
 pub mod sidecar_extract;
+#[cfg(test)]
+mod test_hygiene;
 pub mod validate;
 #[cfg(windows)]
 pub mod win_job;
