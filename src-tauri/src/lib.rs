@@ -105,7 +105,7 @@ pub(crate) use handler::{content_type_for, finish_with_timing, HANDLER_DEPTH, MA
 #[allow(unused_imports)]
 pub(crate) use integrity::{verified_plugins, verify_plugin_integrity};
 #[cfg(test)]
-pub(crate) use lifecycle::{graceful_quit_try_acquire, DIALOG_SHOWING};
+pub(crate) use lifecycle::dialog_try_acquire_in;
 #[cfg(test)]
 pub(crate) use rate_limit::{rate_limiters, RATE_LIMIT_LRU_CAP};
 #[cfg(test)]
@@ -2843,50 +2843,90 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────
     #[test]
     fn t1_dialog_guard_only_one_acquires_under_concurrency() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::{Arc, Barrier};
-        use std::thread;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-        // Reset — other lifecycle tests may have left it true.
-        DIALOG_SHOWING.store(false, Ordering::Release);
+        // PRIVATE flag — this test used to `store(false)` the process-wide
+        // `DIALOG_SHOWING` ("Reset — other lifecycle tests may have left it
+        // true"), which is precisely the race: `lifecycle::tests` serialises its
+        // five dialog tests on `DIALOG_TEST_GUARD`, but that mutex is private to
+        // that module and this test — living in `lib.rs` — could not take it. It
+        // therefore cleared and set the singleton underneath a test that held the
+        // lock: measured 2 reds in 300 loaded runs, always killing
+        // `lifecycle::tests::t_no_shutdown_allows_first_dialog`.
+        //
+        // Owning the flag removes the shared state instead of widening the lock.
+        // The logic under test is still the real one (`dialog_try_acquire_in` is
+        // what `graceful_quit_try_acquire` calls), never a copy.
+        let flag = AtomicBool::new(false);
 
-        // N threads competing for the same guard. MAX_QUEUED+ is sufficient to
-        // force contention pressure under any realistic scheduler (macOS M4
-        // has no deterministic scheduler under massive spawn). A correct CAS
-        // only allows ONE acquire; any mutation (simple store, always-true branch,
-        // etc.) causes > 1 thread to win.
-        let n = 256;
-        let barrier = Arc::new(Barrier::new(n));
-        let acquired = Arc::new(AtomicUsize::new(0));
+        // How the contention is produced, and why it is not a `Barrier` any more.
+        //
+        // The previous shape (256 threads on one `Barrier::wait()`) was a
+        // PROBABILISTIC guard: a barrier releases its waiters by waking parked
+        // threads, which the OS does one after another, so the two-instruction
+        // window of a broken CAS (`load` then `store` instead of `swap`) almost
+        // never had two threads inside it. Measured on this machine: with the
+        // logic mutant applied, that version passed 20 of 20 unloaded runs — the
+        // test promised "any mutation causes > 1 thread to win" and did not
+        // deliver it.
+        //
+        // Two changes make it deterministic:
+        //   · ROUNDS instead of one shot — each round is an independent chance to
+        //     catch the window, so the probability of missing it decays as p^N;
+        //   · a SPIN start instead of a barrier — the workers are already on CPU
+        //     burning `spin_loop()` when the round counter flips, so they enter
+        //     the acquire within nanoseconds of each other instead of waiting to
+        //     be woken up one by one.
+        // Fewer threads than before (8, not 256) on purpose: 256 threads on 16
+        // cores cannot be simultaneous, they queue. Threads that actually run at
+        // the same instant are what creates contention.
+        //
+        // Invariant checked: EXACTLY ONE winner per round, so `winners == ROUNDS`.
+        // Under a broken CAS some round hands the flag to two threads and the
+        // total overshoots.
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 500;
+        let round = AtomicUsize::new(0); // 0 = not started; round r runs at r
+        let done = AtomicUsize::new(0); // workers that finished the current round
+        let acquired = AtomicUsize::new(0);
 
-        let mut handles = Vec::with_capacity(n);
-        for _ in 0..n {
-            let b = barrier.clone();
-            let a = acquired.clone();
-            handles.push(thread::spawn(move || {
-                // Synchronize the start of all threads at the same instant
-                // to maximize real contention on the swap() CAS.
-                b.wait();
-                if graceful_quit_try_acquire() {
-                    a.fetch_add(1, Ordering::Relaxed);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    for r in 1..=ROUNDS {
+                        while round.load(Ordering::Acquire) < r {
+                            std::hint::spin_loop();
+                        }
+                        if dialog_try_acquire_in(&flag) {
+                            acquired.fetch_add(1, Ordering::Relaxed);
+                        }
+                        done.fetch_add(1, Ordering::Release);
+                    }
+                });
+            }
+            for r in 1..=ROUNDS {
+                // Safe to reset: every worker finished round r-1 before we got
+                // here, and none can start round r until `round` is bumped last.
+                flag.store(false, Ordering::Release);
+                done.store(0, Ordering::Release);
+                round.store(r, Ordering::Release);
+                while done.load(Ordering::Acquire) < THREADS {
+                    std::hint::spin_loop();
                 }
-            }));
-        }
-        for h in handles {
-            h.join().unwrap();
-        }
+            }
+        });
 
         let acquired_n = acquired.load(Ordering::Relaxed);
+        let expected = ROUNDS;
         assert_eq!(
-            acquired_n, 1,
-            "C14 guard violated: {acquired_n} threads acquired the dialog guard simultaneously \
-            (expected exactly 1). If > 1, swap(true, AcqRel) has been replaced by a \
-            non-atomic operation or the CAS is broken. If 0, graceful_quit_try_acquire \
-            always returns false (guard permanently blocked)."
+            acquired_n, expected,
+            "C14 guard violated: {acquired_n} acquires over {expected} rounds \
+            (expected exactly one winner per round). If GREATER, swap(true, AcqRel) has been \
+            replaced by a non-atomic operation and two threads got inside the window in some \
+            round. If SMALLER, dialog_try_acquire_in returns false to everybody (guard \
+            permanently blocked)."
         );
-
-        // Release to allow other tests.
-        DIALOG_SHOWING.store(false, Ordering::Release);
+        // No cleanup: the flag was local and dies here. Nothing global was touched.
     }
 
     // C30 — rate_limit_ok_for does not alloc per request: the cache must only

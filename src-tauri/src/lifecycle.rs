@@ -56,7 +56,24 @@ pub(crate) static DIALOG_SHOWING: AtomicBool = AtomicBool::new(false);
 /// would win the guard simultaneously and the test `t1_dialog_guard_only_one_acquires_under_concurrency`
 /// would fail (more than 1 acquired).
 pub(crate) fn graceful_quit_try_acquire() -> bool {
-    !DIALOG_SHOWING.swap(true, Ordering::AcqRel)
+    dialog_try_acquire_in(&DIALOG_SHOWING)
+}
+
+/// The acquire itself, over an EXPLICIT flag.
+///
+/// Same split as `sidecar::try_acquire_in` (c52ae29) and for the same reason:
+/// `DIALOG_SHOWING` is a process-wide singleton, and `DIALOG_TEST_GUARD` — the
+/// mutex that serialises the tests touching it — is private to `lifecycle::tests`,
+/// so a test living in ANOTHER module cannot take it. Rather than widen the lock,
+/// the contention test in `lib.rs` runs on a flag it owns and reaches the REAL
+/// logic through here, so it can neither be perturbed by, nor perturb, the tests
+/// that legitimately drive the singleton.
+///
+/// Production has exactly one caller: `graceful_quit_try_acquire`, on
+/// `DIALOG_SHOWING`. Re-implementing `!flag.swap(true, AcqRel)` inside the test
+/// instead would test a COPY of the logic and stay green while production broke.
+pub(crate) fn dialog_try_acquire_in(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
 }
 
 /// Latched once the user CONFIRMS a quit and the teardown sequence

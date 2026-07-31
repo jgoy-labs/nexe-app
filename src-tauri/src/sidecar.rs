@@ -73,6 +73,22 @@ pub struct SpawnContext {
 /// `lifecycle.rs`: first caller wins, others get an immediate `Err`.
 pub(crate) static RESTART_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+/// The acquire itself, over an EXPLICIT flag.
+///
+/// Split out of [`restart_try_acquire`] for one reason: the unit tests can then
+/// exercise the semantics (first caller wins · N concurrent callers, exactly one
+/// wins) on a flag they OWN, instead of racing each other over the process-wide
+/// singleton. libtest runs a binary's tests on parallel threads in a single
+/// process, so any two tests poking `RESTART_IN_PROGRESS` interleave — measured,
+/// not theoretical (see the test module).
+///
+/// The alternative — re-implementing `!flag.swap(true, AcqRel)` inside the test —
+/// would test a COPY of the logic and stay green while production broke. This
+/// keeps one implementation with one production caller.
+fn try_acquire_in(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
 /// Attempt to acquire the restart-in-progress flag.
 ///
 /// Returns `true` if the caller won (was `false`, now `true`) and may proceed;
@@ -80,7 +96,7 @@ pub(crate) static RESTART_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 ///
 /// Atomic `swap(true, AcqRel)` — same pattern as `graceful_quit_try_acquire`.
 pub(crate) fn restart_try_acquire() -> bool {
-    !RESTART_IN_PROGRESS.swap(true, Ordering::AcqRel)
+    try_acquire_in(&RESTART_IN_PROGRESS)
 }
 
 /// RAII guard that releases `RESTART_IN_PROGRESS` on drop, including panics.
@@ -458,23 +474,65 @@ mod tests {
         assert_eq!(port.get(), 54322);
     }
 
-    /// `restart_try_acquire` returns true on the first call, false while the
-    /// flag is held. Mutation testing: if `swap(true, AcqRel)` were replaced by
+    // ─── Isolation rule for the restart flag ───────────────────────────────
+    //
+    // `RESTART_IN_PROGRESS` is a process-wide singleton and libtest runs this
+    // binary's tests on PARALLEL THREADS in ONE process. Three tests used to
+    // `store(false)` it and then assert on it, so they raced EACH OTHER: a test
+    // that had just cleared the flag could see it already taken by another test,
+    // or a concurrent-acquire test could count two winners because a sibling had
+    // reset the flag mid-barrier.
+    //
+    // Measured on this machine (2026-07-31, 16 cores, under load: 8 CPU hogs +
+    // `--test-threads=64`, `cargo test --lib restart_`):
+    //   · sharing the singleton (the code this replaced): 22 reds in 300 runs,
+    //     and the RED TEST VARIES run to run — `restart_try_acquire_first_caller_wins`
+    //     and `restart_guard_releases_flag_on_drop` alternate, which is the
+    //     signature of a mutual race and not of one bad test;
+    //   · with the isolation below: 0 reds in 300 runs, same protocol, same load.
+    // The auditor saw 2 reds in 6 runs on the pre-1.0.8 baseline under load.
+    // Unloaded it hides: 12/12 and 30/30 green proved nothing.
+    //
+    // The rule from here on:
+    //   · a test that only needs the SEMANTICS owns its own `AtomicBool` and
+    //     goes through `try_acquire_in` — zero shared state, nothing to
+    //     serialise, and it can never be flaky;
+    //   · a test that must touch the SINGLETON (only the `RestartGuard` one:
+    //     `Drop` is hard-wired to the static and making it injectable would
+    //     change the production call sites in `lib.rs`) takes
+    //     `GLOBAL_FLAG_LOCK` first.
+
+    /// Serialises the tests that touch the process-wide `RESTART_IN_PROGRESS`.
+    /// Today exactly one test needs it; it exists so the NEXT test that reaches
+    /// for the singleton has an obvious, cheap way to stay honest instead of
+    /// silently re-introducing the race.
+    static GLOBAL_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `try_acquire_in` returns true on the first call, false while the flag is
+    /// held. Mutation testing: if `swap(true, AcqRel)` were replaced by
     /// `store(true, ...)` the second caller would still see `false→true` (and
     /// erroneously win), so this test would catch it.
+    ///
+    /// Runs on a PRIVATE flag: no other test can perturb it (see the isolation
+    /// rule above).
     #[test]
     fn restart_try_acquire_first_caller_wins() {
-        RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
-        assert!(restart_try_acquire());
-        assert!(!restart_try_acquire());
-        // Cleanup
-        RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let flag = AtomicBool::new(false);
+        assert!(super::try_acquire_in(&flag));
+        assert!(!super::try_acquire_in(&flag));
     }
 
     /// `RestartGuard` must release `RESTART_IN_PROGRESS` on drop — including the
     /// normal scope-exit case and panic unwinding (RAII semantics).
+    ///
+    /// This is the ONE test that cannot be isolated: `RestartGuard::drop` writes
+    /// the static by construction, and that wiring (public `restart_try_acquire`
+    /// → the singleton → the guard) is exactly what must be covered. It takes
+    /// `GLOBAL_FLAG_LOCK`. `unwrap_or_else(into_inner)` because a poisoned lock
+    /// from an unrelated panic must not turn this into a second failure.
     #[test]
     fn restart_guard_releases_flag_on_drop() {
+        let _lock = GLOBAL_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
         assert!(restart_try_acquire());
         {
@@ -482,38 +540,37 @@ mod tests {
             assert!(RESTART_IN_PROGRESS.load(Ordering::SeqCst));
         }
         assert!(!RESTART_IN_PROGRESS.load(Ordering::SeqCst));
+        RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 
     /// Concurrent attempts to acquire the restart flag: exactly one wins.
     /// Same shape as `try_acquire_concurrent_only_one_wins` in `lifecycle.rs`
     /// for the dialog guard.
+    ///
+    /// Also on a PRIVATE flag, borrowed by the threads via `thread::scope` — the
+    /// contention this test measures is between ITS OWN ten threads, which is
+    /// the property under test; contention with other tests was never part of it
+    /// and was the whole source of the flakiness.
     #[test]
     fn restart_try_acquire_concurrent_only_one_wins() {
-        use std::sync::Arc;
-        RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
-        let winners = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let barrier = Arc::new(std::sync::Barrier::new(10));
-        let handles: Vec<_> = (0..10)
-            .map(|_| {
-                let w = winners.clone();
-                let b = barrier.clone();
-                std::thread::spawn(move || {
-                    b.wait();
-                    if restart_try_acquire() {
-                        w.fetch_add(1, Ordering::Relaxed);
+        let flag = AtomicBool::new(false);
+        let winners = std::sync::atomic::AtomicU32::new(0);
+        let barrier = std::sync::Barrier::new(10);
+        std::thread::scope(|s| {
+            for _ in 0..10 {
+                s.spawn(|| {
+                    barrier.wait();
+                    if super::try_acquire_in(&flag) {
+                        winners.fetch_add(1, Ordering::Relaxed);
                     }
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().unwrap();
-        }
+                });
+            }
+        });
         assert_eq!(
             winners.load(Ordering::Relaxed),
             1,
             "exactly one thread must acquire the restart flag"
         );
-        RESTART_IN_PROGRESS.store(false, Ordering::SeqCst);
     }
 
     /// `reserve_ephemeral_port` must not hand the same port twice in rapid

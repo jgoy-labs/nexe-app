@@ -21,12 +21,19 @@ import { t } from "./onboarding/i18n.js";
 const MODAL_ID = "uninstall-modal-overlay";
 
 // Ids of the option checkboxes — single source of truth for build + collect.
+//
+// Findings 830/836: the modal asks TWO independent questions. Everything but
+// `uninstallApp` erases DATA and leaves the app installed and usable;
+// `uninstallApp` removes the application itself. Each half is confirmed
+// separately by the Rust command (its own native dialog), so a user can tick
+// one, the other, or both — and the labels now say which is which.
 const OPT_IDS = {
   models: "uninstall-opt-models",
   conversations: "uninstall-opt-conversations",
   library: "uninstall-opt-library",
   ollama: "uninstall-opt-ollama",
   embeddingsCache: "uninstall-opt-embeddings",
+  uninstallApp: "uninstall-opt-app",
 };
 
 const MODAL_CSS = `
@@ -56,6 +63,10 @@ const MODAL_CSS = `
   margin-top: .15rem; width: 16px; height: 16px; flex: 0 0 auto; accent-color: #e62020; cursor: pointer;
 }
 #${MODAL_ID} .opt-desc { display: block; font-size: .72rem; opacity: .58; margin-top: .1rem; }
+#${MODAL_ID} .uninstall-section { margin: .9rem 0 .25rem; padding-top: .7rem; border-top: 1px solid #2a2a2a; }
+#${MODAL_ID} .uninstall-section:first-of-type { margin-top: .2rem; }
+#${MODAL_ID} .uninstall-section h3 { font-size: .93rem; margin: 0; }
+#${MODAL_ID} .uninstall-section .section-desc { font-size: .74rem; opacity: .6; margin: .2rem 0 .35rem; line-height: 1.35; }
 #${MODAL_ID} .uninstall-warn { color: #e6a020; font-size: .76rem; margin: .7rem 0 0; }
 #${MODAL_ID} .uninstall-status { font-size: .76rem; opacity: .8; margin: .45rem 0 0; min-height: 1em; }
 #${MODAL_ID} .uninstall-actions {
@@ -100,11 +111,12 @@ export function collectOpts(root) {
     library: checked(OPT_IDS.library),
     ollama: checked(OPT_IDS.ollama),
     embeddings_cache: checked(OPT_IDS.embeddingsCache),
+    uninstall_app: checked(OPT_IDS.uninstallApp),
   };
 }
 
-/** True when at least one category is selected. */
-export function hasSelection(opts) {
+/** True when at least one DATA category is selected (the app box is not data). */
+export function hasDataSelection(opts) {
   return !!(
     opts.models ||
     opts.conversations ||
@@ -112,6 +124,29 @@ export function hasSelection(opts) {
     opts.ollama ||
     opts.embeddings_cache
   );
+}
+
+/** True when anything at all is selected — data, the app, or both. */
+export function hasSelection(opts) {
+  return hasDataSelection(opts) || !!opts.uninstall_app;
+}
+
+/**
+ * Heading + one-line explanation for one of the two blocks. The two questions
+ * ("erase my data" / "uninstall nexe") must be visually separate — 830 was a
+ * user reading one flat list of checkboxes as a single "remove everything".
+ */
+function sectionHeader(doc, lang, titleKey, descKey) {
+  const wrap = doc.createElement("div");
+  wrap.className = "uninstall-section";
+  const h3 = doc.createElement("h3");
+  h3.textContent = t(titleKey, lang);
+  wrap.appendChild(h3);
+  const desc = doc.createElement("p");
+  desc.className = "section-desc";
+  desc.textContent = t(descKey, lang);
+  wrap.appendChild(desc);
+  return wrap;
 }
 
 function optionRow(doc, lang, id, labelKey, descKey) {
@@ -159,6 +194,10 @@ export function buildUninstallModal(doc, lang, { onCancel, onConfirm }) {
   intro.textContent = t("uninstall_intro", lang);
   card.appendChild(intro);
 
+  // ── Block 1: erase my data (the app survives) ────────────────────────────
+  card.appendChild(
+    sectionHeader(doc, lang, "uninstall_section_data", "uninstall_section_data_desc")
+  );
   card.appendChild(
     optionRow(doc, lang, OPT_IDS.models, "uninstall_opt_models", "uninstall_opt_models_desc")
   );
@@ -187,6 +226,14 @@ export function buildUninstallModal(doc, lang, { onCancel, onConfirm }) {
     )
   );
 
+  // ── Block 2: uninstall the app itself (independent question, own gate) ───
+  card.appendChild(
+    sectionHeader(doc, lang, "uninstall_section_app", "uninstall_section_app_desc")
+  );
+  card.appendChild(
+    optionRow(doc, lang, OPT_IDS.uninstallApp, "uninstall_opt_app", "uninstall_opt_app_desc")
+  );
+
   const warn = doc.createElement("p");
   warn.className = "uninstall-warn";
   warn.textContent = t("uninstall_warn", lang);
@@ -212,11 +259,13 @@ export function buildUninstallModal(doc, lang, { onCancel, onConfirm }) {
     onConfirm(overlay, { status, confirmBtn, cancelBtn })
   );
 
-  // UX1: "Erase everything and quit" — tick all four boxes (incl. Ollama) AND
-  // submit, matching what the label promises. Ticking alone would be a lie: the
-  // user would still have to press Uninstall. Routes through the SAME onConfirm
-  // (which hits the native WSA-002 gate + exit), so it is not a shortcut around
-  // the confirmation.
+  // UX1: "Erase everything and uninstall" — tick EVERY box (data + the app
+  // itself) AND submit, matching what the label promises. 830: Jordi ticked the
+  // old "erase everything" and the app was still installed afterwards, because
+  // this button only covered the data boxes. Ticking alone would also be a lie
+  // (the user would still have to press Uninstall). Routes through the SAME
+  // onConfirm, which hits the native WSA-002 gates, so it is not a shortcut
+  // around any confirmation — the user still acknowledges both.
   const allBtn = doc.createElement("button");
   allBtn.type = "button";
   allBtn.className = "btn-all";

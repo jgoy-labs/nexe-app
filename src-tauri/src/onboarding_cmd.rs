@@ -269,6 +269,42 @@ fn remove_dir_tracked(report: &mut UninstallReport, path: &std::path::Path) {
     }
 }
 
+/// The REAL on-disk homes of the user's conversations and persistent memory,
+/// derived from `data_dir` (`app_data_dir()`).
+///
+/// Finding 835 — the previous list pointed at `<data>/sidecar/storage`, which
+/// NEVER exists: `remove_dir_all_resilient` maps NotFound to success, so the
+/// removal was a silent no-op and the real chat history survived every
+/// "Conversations" wipe. Measured on a real install (macOS, 2026-07-31,
+/// `~/Library/Application Support/com.nexe.app/sidecar`) and cross-checked
+/// against the sidecar code that WRITES each store:
+///   - `data/sessions`        — the chat history itself, one encrypted `.enc`
+///     file per session. `plugins/web_ui_module/module.py` builds the
+///     `SessionManager` with `get_data_dir("sessions")`, and `core/paths/helpers.py`
+///     resolves `get_data_dir()` to `$NEXE_DATA_DIR` (= `<data>/sidecar/data`,
+///     injected by `spawn_sidecar_process` in lib.rs).
+///   - `vectors`              — Qdrant collection + `memory_v1.db` +
+///     `metadata_memory.db` (`$NEXE_QDRANT_PATH`, same injection).
+///   - `app/storage/memory`   — the memory subsystem's own store; the sidecar's
+///     project root is `$NEXE_HOME` = `<data>/sidecar/app` (cwd pinned there),
+///     so its `storage/` lives one level deeper than the old guess.
+///   - `app/storage/vectors`  — the project-root vector store used by the
+///     `lifespan_modules.py` fallback branch (`project_root/storage/vectors`).
+///
+/// `app/storage/system_core.db` and `app/storage/system-logs` are deliberately
+/// NOT here: they are system state, not conversations — the full "everything"
+/// wipe removes them with the whole data dir.
+fn conversation_dirs(data_dir: &Path) -> Vec<PathBuf> {
+    let sidecar = data_dir.join("sidecar");
+    let app_storage = sidecar.join("app").join("storage");
+    vec![
+        sidecar.join("data").join("sessions"),
+        sidecar.join("vectors"),
+        app_storage.join("memory"),
+        app_storage.join("vectors"),
+    ]
+}
+
 /// Full uninstall: removes onboarding state, extracted bundle, downloaded
 /// models, AND WebKit localStorage so the wizard starts fresh on next launch.
 /// Called from the tray "Uninstall" menu item.
@@ -331,8 +367,10 @@ fn reset_paths(
     if full {
         let sidecar = data_dir.join("sidecar");
         remove_dir_tracked(&mut report, &sidecar.join("data").join("models"));
-        remove_dir_tracked(&mut report, &sidecar.join("vectors"));
-        remove_dir_tracked(&mut report, &sidecar.join("storage"));
+        // Conversations + memory at their REAL paths (finding 835).
+        for dir in conversation_dirs(data_dir) {
+            remove_dir_tracked(&mut report, &dir);
+        }
 
         // WebView storage (localStorage/IndexedDB) lives outside the app data
         // dir, in a platform-specific WebKit location keyed by bundle id.
@@ -376,7 +414,8 @@ pub struct UninstallOptions {
     /// Downloaded AI models (`<data_dir>/sidecar/data/models`).
     #[serde(default)]
     pub models: bool,
-    /// Conversations + persistent memory: Qdrant `vectors` + SQLite `storage`.
+    /// Conversations + persistent memory, at the paths listed in
+    /// [`conversation_dirs`] (chat sessions, Qdrant vectors, memory stores).
     #[serde(default)]
     pub conversations: bool,
     /// Everything: the whole app data + config + platform Library dirs (WebKit,
@@ -396,6 +435,23 @@ pub struct UninstallOptions {
     /// only as the EXACT path, never a prefix (`~/.cache` is off-limits).
     #[serde(default)]
     pub embeddings_cache: bool,
+    /// Remove the APPLICATION ITSELF (findings 830/836): the macOS `.app`
+    /// bundle or the Linux AppImage, plus our entries in the platform secret
+    /// store. Deliberately INDEPENDENT of every data flag above and gated by
+    /// its OWN native confirmation — the two questions ("erase my data" and
+    /// "uninstall the app") are different questions, and the old single
+    /// checkbox answered only the first one while the user believed it
+    /// answered both.
+    #[serde(default)]
+    pub uninstall_app: bool,
+}
+
+impl UninstallOptions {
+    /// `true` when at least one DATA category is selected. The app-removal
+    /// checkbox is not data and is tracked separately (own confirmation).
+    fn any_data(&self) -> bool {
+        self.models || self.conversations || self.library || self.ollama || self.embeddings_cache
+    }
 }
 
 /// Serializable result returned to the frontend by `uninstall_with_options`.
@@ -544,17 +600,48 @@ fn library_data_dirs(home: &Path) -> Vec<PathBuf> {
 /// the legacy installer's Preferences plist behind forever). Removed only on
 /// a full `library` wipe — "as freshly installed" must include our own past.
 /// The names are ours (legacy branding), never third-party.
+/// Finding 838 — until this commit the panic hook wrote its crash reports to
+/// `<data_local>/nexe-app/crashes` (bare product name), NOT under the bundle id,
+/// so no sweep ever reached them and 0600 stack traces survived every uninstall.
+/// `main.rs` now writes under `<data_local>/com.nexe.app/crashes` (already inside
+/// the wipe), and this entry sweeps the ORPHANED dir left by every build shipped
+/// before the fix. It is OUR own directory (created by our own panic hook), it is
+/// added to the LEGACY list on purpose — never to `library_data_dirs`, whose
+/// bundle-id invariant (and the ubuntu-22.04 CI assert on it) must hold.
+/// `<data_local>` is `~/Library/Application Support` (macOS), `~/.local/share`
+/// (Linux) and `%LOCALAPPDATA%` = `home\AppData\Local` (Windows), derived from
+/// `home` exactly like `library_data_dirs` so the containment guard agrees.
+fn legacy_crash_dir(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library")
+            .join("Application Support")
+            .join("nexe-app")
+    }
+    #[cfg(target_os = "linux")]
+    {
+        home.join(".local").join("share").join("nexe-app")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        home.join("AppData").join("Local").join("nexe-app")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        home.join("nexe-app")
+    }
+}
+
 fn legacy_leftover_dirs(home: &Path) -> Vec<PathBuf> {
+    // The pre-fix crash-report dir exists on every platform (finding 838).
+    let mut dirs = vec![legacy_crash_dir(home)];
     #[cfg(target_os = "macos")]
     {
         let app_support = home.join("Library").join("Application Support");
-        vec![app_support.join("Nexe"), app_support.join("server.nexe")]
+        dirs.push(app_support.join("Nexe"));
+        dirs.push(app_support.join("server.nexe"));
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = home; // legacy leftovers only modelled on macOS so far
-        Vec::new()
-    }
+    dirs
 }
 
 /// Legacy FILES (not dirs) from the pre-Tauri installer. Same policy as
@@ -572,6 +659,199 @@ fn legacy_leftover_files(home: &Path) -> Vec<PathBuf> {
     {
         let _ = home;
         Vec::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Findings 830 / 836 — "Uninstall nexe": removing the APPLICATION itself.
+//
+// 830: the modal only ever reset DATA. The user ticked "erase everything", the
+// app disappeared from the screen and the launcher entry was still there — the
+// checkbox lied by omission. 836 (Linux live 17/07): the same wipe left the
+// AppImage on the Desktop and then quit with no message, which read as a crash.
+//
+// A running process cannot delete its own bundle and then keep running, so the
+// removal is DELEGATED: we spawn a detached `/bin/sh` that waits for OUR pid to
+// disappear and only then removes the artifact. The wait is bounded (60 s) and
+// the removal is conditional on the pid being really gone — if the app somehow
+// survives, nothing is deleted.
+//
+// What is NOT implemented, on purpose:
+//   - LaunchAgents. MEASURED 2026-07-31: `grep -rn "LaunchAgent\|launchctl"` over
+//     this repo returns ZERO hits — nexe-app installs none. The plists present on
+//     a developer machine (`com.jgoy.*`) belong to the USER, and deleting an agent
+//     we never created would be destroying their configuration.
+//   - Windows. The bundle is installed by an NSIS/MSI installer that owns its own
+//     uninstall entry; self-deleting around it would fight the package database.
+//     The dialog says so instead of pretending.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Suffix the app artifact must carry on this platform for the guard to accept
+/// it as a self-removal target (macOS bundle dir / Linux AppImage file).
+#[cfg(target_os = "macos")]
+const APP_ARTIFACT_SUFFIX: &str = ".app";
+#[cfg(target_os = "linux")]
+const APP_ARTIFACT_SUFFIX: &str = ".AppImage";
+
+/// What "Uninstall nexe" can remove from disk on this platform.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppArtifact {
+    /// A single path that may be deleted once this process is gone.
+    SelfRemovable(PathBuf),
+    /// We are not the owner of the installed files — the reason is shown to the
+    /// user verbatim so the modal never claims a removal it cannot perform.
+    NotSelfRemovable(&'static str),
+}
+
+/// Resolve the app artifact from the running executable. Pure (both inputs are
+/// injected) so every branch is unit-testable without touching the real install.
+///
+/// - macOS: the nearest ancestor of the executable that ends in `.app`
+///   (`/Applications/nexe-app.app/Contents/MacOS/nexe-app` → the bundle).
+/// - Linux: `$APPIMAGE`, the absolute path of the running AppImage, exported by
+///   the AppImage runtime itself. Absent ⇒ a packaged install (`.deb` under
+///   `/usr/bin`), which is the package manager's property, not ours.
+/// - Anything else: not self-removable.
+fn app_artifact(exe: &Path, appimage: Option<&Path>) -> AppArtifact {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = appimage; // no AppImage on macOS
+        match exe
+            .ancestors()
+            .find(|a| is_safe_app_artifact(a))
+            .map(|a| a.to_path_buf())
+        {
+            Some(bundle) => AppArtifact::SelfRemovable(bundle),
+            None => AppArtifact::NotSelfRemovable(
+                "not running from an .app bundle — remove the executable by hand / no s'executa des d'un .app: esborra el binari a mà",
+            ),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = exe; // the AppImage runtime is the only reliable source
+        match appimage {
+            Some(p) if is_safe_app_artifact(p) => AppArtifact::SelfRemovable(p.to_path_buf()),
+            _ => AppArtifact::NotSelfRemovable(
+                "packaged install (.deb) — remove it with your package manager / instal·lació per paquet: fes servir el gestor de paquets",
+            ),
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (exe, appimage);
+        AppArtifact::NotSelfRemovable(
+            "use the Windows uninstaller (Apps & features) / fes servir el desinstal·lador de Windows",
+        )
+    }
+}
+
+/// Paranoid guard for the ONE path the self-delete helper is allowed to touch.
+/// Mirrors [`is_safe_to_remove`]'s philosophy (the sweep's guard cannot be
+/// reused: the artifact lives outside every app-owned base, in `/Applications`
+/// or wherever the user parked the AppImage). All of:
+///   (1) absolute — a relative `rm -rf` would resolve against the helper's cwd;
+///   (2) no `..` component — a traversal could escape whatever we checked;
+///   (3) the file name carries this platform's artifact suffix — a bare
+///       directory name can never qualify;
+///   (4) at least two path components below the root, so `/x.app` (a root-level
+///       artifact) is refused rather than nuked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn is_safe_app_artifact(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    let named = path
+        .file_name()
+        .map(|n| n.to_string_lossy().ends_with(APP_ARTIFACT_SUFFIX))
+        .unwrap_or(false);
+    let depth = path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    named && depth >= 2
+}
+
+/// POSIX single-quote a string for `sh -c`. The artifact path is attacker-proof
+/// by construction (it comes from `current_exe()`), but it routinely contains
+/// spaces (`/Applications/My App.app`) and must survive the shell verbatim.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The detached script: wait (bounded) for `pid` to die, then remove `target`
+/// ONLY if it is really gone. Pure so the contract is unit-tested; the sleep
+/// budget is 300 × 0.2 s = 60 s, after which we give up WITHOUT deleting.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn self_delete_script(target: &Path, pid: u32) -> String {
+    format!(
+        "i=0; while kill -0 {pid} 2>/dev/null && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done; \
+         kill -0 {pid} 2>/dev/null || rm -rf -- {}",
+        sh_quote(&target.to_string_lossy())
+    )
+}
+
+/// Spawn the detached remover. Returns an error string (for the report) instead
+/// of panicking: a failed spawn must be TOLD to the user, not swallowed (B058).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn spawn_self_delete(target: &Path, pid: u32) -> Result<(), String> {
+    if !is_safe_app_artifact(target) {
+        return Err(format!(
+            "{}: refused (unsafe app artifact — guard)",
+            target.display()
+        ));
+    }
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(self_delete_script(target, pid))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}: could not spawn the remover: {e}", target.display()))
+}
+
+/// Result of the "Uninstall nexe" half, reported in the closing dialog.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppRemovalOutcome {
+    /// The remover is armed; `PathBuf` disappears once this process exits.
+    Scheduled(PathBuf),
+    /// Nothing was armed, and why (shown verbatim).
+    Skipped(String),
+}
+
+/// Arm the removal of the running app. Reads the two environment facts
+/// (`current_exe()`, `$APPIMAGE`) and delegates every decision to the pure
+/// helpers above.
+fn schedule_app_removal() -> AppRemovalOutcome {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => return AppRemovalOutcome::Skipped(format!("current_exe failed: {e}")),
+    };
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    match app_artifact(&exe, appimage.as_deref()) {
+        AppArtifact::NotSelfRemovable(reason) => AppRemovalOutcome::Skipped(reason.to_string()),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        AppArtifact::SelfRemovable(target) => {
+            match spawn_self_delete(&target, std::process::id()) {
+                Ok(()) => AppRemovalOutcome::Scheduled(target),
+                Err(e) => AppRemovalOutcome::Skipped(e),
+            }
+        }
+        // Windows/other never yield SelfRemovable — the arm is unreachable there.
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        AppArtifact::SelfRemovable(target) => AppRemovalOutcome::Skipped(format!(
+            "{}: self-removal is not implemented on this platform",
+            target.display()
+        )),
     }
 }
 
@@ -627,18 +907,11 @@ pub fn selective_reset_paths(
             );
         }
         if opts.conversations {
-            remove_dir_guarded(
-                &mut report,
-                &data_dir.join("sidecar").join("vectors"),
-                home,
-                &owned_bases,
-            );
-            remove_dir_guarded(
-                &mut report,
-                &data_dir.join("sidecar").join("storage"),
-                home,
-                &owned_bases,
-            );
+            // Finding 835: the REAL stores (measured), not the phantom
+            // `sidecar/storage` the old code silently no-op'd on.
+            for dir in conversation_dirs(data_dir) {
+                remove_dir_guarded(&mut report, &dir, home, &owned_bases);
+            }
         }
     }
 
@@ -885,9 +1158,11 @@ fn delete_keychain_token(report: &mut UninstallReport) {
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn delete_keychain_token(_report: &mut UninstallReport) {}
 
-/// Human-readable list of what the sweep will remove, shown in the native gate so
-/// the user acknowledges the exact scope before anything is deleted.
-fn uninstall_summary(opts: &UninstallOptions) -> String {
+/// Human-readable list of what the DATA sweep will remove, shown in its own
+/// native gate so the user acknowledges the exact scope before anything is
+/// deleted. Finding 830: it now says explicitly that the app itself survives —
+/// that omission is what made "erase everything" read as "uninstall".
+fn data_summary(opts: &UninstallOptions) -> String {
     if opts.library {
         let mut s = String::from(
             "• All configuration, keys, onboarding state, models and conversations (full wipe)\n• Embeddings cache (~/.cache/fastembed, ~1 GB)",
@@ -895,6 +1170,9 @@ fn uninstall_summary(opts: &UninstallOptions) -> String {
         if opts.ollama {
             s.push_str("\n• Ollama shared models (~/.ollama)");
         }
+        s.push_str(
+            "\n\nThe app itself stays installed. / L'aplicació segueix instal·lada al disc.",
+        );
         return s;
     }
     let mut lines: Vec<&str> = Vec::new();
@@ -913,17 +1191,97 @@ fn uninstall_summary(opts: &UninstallOptions) -> String {
     if lines.is_empty() {
         return String::from("• (nothing selected)");
     }
+    let mut s = lines.join("\n");
+    s.push_str("\n\nThe app itself stays installed. / L'aplicació segueix instal·lada al disc.");
+    s
+}
+
+/// Scope shown in the SECOND, independent native gate (the "Uninstall nexe"
+/// checkbox). It names the artifact that will actually disappear, so the user
+/// can recognise it — finding 830 was born of a promise nobody could check.
+fn app_removal_summary(artifact: &AppArtifact) -> String {
+    match artifact {
+        AppArtifact::SelfRemovable(p) => format!(
+            "• The application itself / l'aplicació:\n  {}\n• Our entries in the system secret store (Keychain / Credential Manager / keyring)\n\nYour data is only removed if you also ticked the data box. / Les teves dades només s'esborren si també has marcat la casella de dades.",
+            p.display()
+        ),
+        AppArtifact::NotSelfRemovable(reason) => format!(
+            "• Our entries in the system secret store (Keychain / Credential Manager / keyring)\n\nThe application files CANNOT be removed by nexe itself / els fitxers de l'aplicació NO els pot esborrar el propi nexe:\n  {reason}"
+        ),
+    }
+}
+
+/// Closing message shown BEFORE the app quits (finding 836).
+///
+/// Live 17/07 on Linux the wipe finished and the process vanished with no word,
+/// which the user read as a crash ("sembla que tomba"). The app now states what
+/// happened — including failures, and including the case where the app stays
+/// installed — and only exits once the user acknowledges it.
+fn completion_message(
+    report: &UninstallReport,
+    data_done: bool,
+    app_removal: Option<&AppRemovalOutcome>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if data_done {
+        if report.all_ok() {
+            lines.push("• Data erased successfully. / Dades esborrades correctament.".to_string());
+        } else {
+            lines.push(format!(
+                "• Some items could NOT be removed / alguns elements NO s'han pogut esborrar:\n  {}",
+                report.failures.join("\n  ")
+            ));
+        }
+    }
+    match app_removal {
+        Some(AppRemovalOutcome::Scheduled(p)) => lines.push(format!(
+            "• The application will be removed as it closes / l'aplicació s'esborrarà en tancar-se:\n  {}",
+            p.display()
+        )),
+        Some(AppRemovalOutcome::Skipped(reason)) => lines.push(format!(
+            "• The application was NOT removed / l'aplicació NO s'ha esborrat:\n  {reason}"
+        )),
+        None => lines.push(
+            "• The application stays installed and usable. / L'aplicació segueix instal·lada i utilitzable.".to_string(),
+        ),
+    }
+    lines.push(String::new());
+    lines.push("nexe will close now. / nexe es tancarà ara.".to_string());
     lines.join("\n")
 }
 
-/// Selective uninstall driven by the frontend modal (Finding B). The user picks
-/// WHICH categories to remove via [`UninstallOptions`] for a clean reinstall.
+/// Native gate on the blocking pool — never on the UI thread, never
+/// fire-and-forget (both deadlock/never-fire on Windows ARM64, see
+/// lifecycle.rs / reset_installation). Returns the user's answer.
+async fn native_confirm(app: &AppHandle, title: &str, body: String) -> bool {
+    let app = app.clone();
+    let title = title.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .message(body)
+            .title(title)
+            .kind(MessageDialogKind::Warning)
+            .buttons(MessageDialogButtons::OkCancel)
+            .blocking_show()
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Selective uninstall driven by the frontend modal. The user answers TWO
+/// independent questions (findings 830/836) and each one has its OWN gate:
+///   A. "Erase my data" — the per-category flags of [`UninstallOptions`];
+///   B. "Uninstall nexe" — [`UninstallOptions::uninstall_app`], the app itself
+///      plus our entries in the platform secret store.
+/// Either, neither or both may be ticked; cancelling one gate does NOT cancel
+/// the other. The old single gate conflated them, so a user who wanted "erase
+/// everything" got a data reset and an app that was still installed (830).
 ///
 /// NEXE-APP-WSA-002: this is a DESTRUCTIVE IPC command reachable by any injected
-/// `invoke("uninstall_with_options", …)`, so it is gated behind a NATIVE
+/// `invoke("uninstall_with_options", …)`, so each half is gated behind a NATIVE
 /// confirmation dialog (spawn_blocking + `blocking_show`, the same pattern as
 /// `reset_installation`) that lists exactly what will be removed. A scripted
-/// caller cannot dismiss a native modal it did not open, so no wipe happens
+/// caller cannot dismiss a native modal it did not open, so nothing happens
 /// without a real user acknowledging it. On cancel — or when nothing is selected
 /// — it returns `exited: false` and touches nothing.
 ///
@@ -933,46 +1291,65 @@ fn uninstall_summary(opts: &UninstallOptions) -> String {
 ///      the sidecar mid-wipe (which would recreate storage/models);
 ///   2. kill the sidecar FIRST so it cannot keep writing to the trees we delete;
 ///   3. run `selective_reset_paths` (paranoid path guard inside);
-///   4. (library only) best-effort Keychain delete of the HF token;
-///   5. latch `EXIT_CONFIRMED` and `app.exit(0)` — ANY removal kills the running
-///      sidecar, so a fresh launch is the only clean state; the modal already
-///      warned the user the app will close.
+///   4. best-effort secret-store delete (full data wipe or app removal — both
+///      promise the keys are gone);
+///   5. arm the detached app remover if B was confirmed;
+///   6. TELL THE USER what happened and wait for the acknowledgement (836 — the
+///      silent exit was read as a crash), then latch `EXIT_CONFIRMED` and
+///      `app.exit(0)`: any removal killed the sidecar, so a fresh launch is the
+///      only clean state.
 #[tauri::command]
 pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> UninstallOutcome {
     // Nothing selected → no gate, no exit (protects against an empty/malformed
     // IPC payload and a pointless app restart).
-    if !opts.models
-        && !opts.conversations
-        && !opts.library
-        && !opts.ollama
-        && !opts.embeddings_cache
-    {
+    if !opts.any_data() && !opts.uninstall_app {
         return UninstallOutcome {
             failures: Vec::new(),
             exited: false,
         };
     }
 
-    // Native gate (WSA-002): never on the UI thread, never fire-and-forget —
-    // both deadlock/never-fire on Windows ARM64 (see lifecycle.rs / reset_installation).
-    let summary = uninstall_summary(&opts);
-    let confirmed = {
-        let app = app.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            app.dialog()
-                .message(format!(
-                    "This will remove:\n\n{summary}\n\nThe app will then close. This cannot be undone.\n\nAixò esborrarà el que has triat i tot seguit l'app es tancarà. No es pot desfer."
-                ))
-                .title("Confirm uninstall")
-                .kind(MessageDialogKind::Warning)
-                .buttons(MessageDialogButtons::OkCancel)
-                .blocking_show()
-        })
+    // ── Gate A: the data wipe ────────────────────────────────────────────────
+    let data_confirmed = if opts.any_data() {
+        let summary = data_summary(&opts);
+        native_confirm(
+            &app,
+            "Erase your data",
+            format!(
+                "This will remove:\n\n{summary}\n\nThis cannot be undone.\n\nAixò esborrarà el que has triat. No es pot desfer."
+            ),
+        )
         .await
-        .unwrap_or(false)
+    } else {
+        false
     };
 
-    if !confirmed {
+    // ── Gate B: the app removal (independent — its own question, own answer) ──
+    // The artifact is resolved BEFORE asking so the dialog can name the exact
+    // path (or explain why there is nothing we may delete).
+    let artifact = if opts.uninstall_app {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+        Some(app_artifact(&exe, appimage.as_deref()))
+    } else {
+        None
+    };
+    let app_confirmed = match &artifact {
+        Some(a) => {
+            let summary = app_removal_summary(a);
+            native_confirm(
+                &app,
+                "Uninstall nexe",
+                format!(
+                    "This will remove:\n\n{summary}\n\nThe app will then close. This cannot be undone.\n\nTot seguit l'app es tancarà. No es pot desfer."
+                ),
+            )
+            .await
+        }
+        None => false,
+    };
+
+    if !data_confirmed && !app_confirmed {
         return UninstallOutcome {
             failures: Vec::new(),
             exited: false,
@@ -989,19 +1366,26 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
         crate::lifecycle::kill_sidecar_child(&state.0);
     }
 
-    // 3. Selective sweep (guarded) + 4. Keychain — on the BLOCKING pool, never
-    //    the async reactor: the Windows-resilient removal sleeps between retries
-    //    while the killed sidecar's file handles drain (BUG 2), and blocking the
-    //    reactor for seconds would stall other tasks. Move the paths + opts in;
-    //    a formatted copy of opts stays behind for logging.
+    // 3. Selective sweep (guarded) + 4. secret store — on the BLOCKING pool,
+    //    never the async reactor: the Windows-resilient removal sleeps between
+    //    retries while the killed sidecar's file handles drain (BUG 2), and
+    //    blocking the reactor for seconds would stall other tasks. Only the
+    //    categories the user CONFIRMED in gate A are swept.
     let config_dir = app.path().app_config_dir().unwrap_or_default();
     let data_dir = app.path().app_data_dir().unwrap_or_default();
     let home = home_dir_or_default();
-    let opts_for_log = format!("{opts:?}");
+    let opts_for_log =
+        format!("{opts:?} data_confirmed={data_confirmed} app_confirmed={app_confirmed}");
+    // The keys are promised gone by BOTH halves: the full data wipe says
+    // "configuration, keys and state", and the app removal says the secret
+    // store is cleared. Deleting twice is idempotent.
+    let wipe_secrets = (data_confirmed && opts.library) || app_confirmed;
     let report = tauri::async_runtime::spawn_blocking(move || {
-        let mut report = selective_reset_paths(&config_dir, &data_dir, &home, &opts);
-        // Keychain — only on a full library wipe (token = part of config/keys).
-        if opts.library {
+        let mut report = UninstallReport::default();
+        if data_confirmed {
+            report = selective_reset_paths(&config_dir, &data_dir, &home, &opts);
+        }
+        if wipe_secrets {
             delete_keychain_token(&mut report);
         }
         report
@@ -1014,13 +1398,37 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
         r
     });
 
-    if report.all_ok() {
-        tracing::info!(opts = %opts_for_log, "selective uninstall complete — exiting");
+    // 5. Arm the app remover AFTER the sweep: the helper only waits for our pid,
+    //    so ordering is free, and doing it last means a sweep that dies never
+    //    leaves a scheduled deletion behind.
+    let app_removal = if app_confirmed {
+        Some(schedule_app_removal())
     } else {
-        tracing::error!(opts = %opts_for_log, failures = ?report.failures, "selective uninstall finished with errors");
+        None
+    };
+
+    if report.all_ok() {
+        tracing::info!(opts = %opts_for_log, removal = ?app_removal, "uninstall complete — exiting");
+    } else {
+        tracing::error!(opts = %opts_for_log, removal = ?app_removal, failures = ?report.failures, "uninstall finished with errors");
     }
 
-    // 5. Exit — any removal killed the sidecar; a fresh launch is the clean state.
+    // 6. Say what happened and WAIT for the OK (836: the app used to vanish
+    //    mid-uninstall with no word, which reads as a crash).
+    let closing = completion_message(&report, data_confirmed, app_removal.as_ref());
+    {
+        let app = app.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            app.dialog()
+                .message(closing)
+                .title("nexe")
+                .kind(MessageDialogKind::Info)
+                .buttons(MessageDialogButtons::Ok)
+                .blocking_show()
+        })
+        .await;
+    }
+
     // MC-057: EXIT_CONFIRMED before app.exit(0) so ExitRequested does not pop a
     // second "Quit?" dialog.
     crate::lifecycle::EXIT_CONFIRMED.store(true, Ordering::Relaxed);
@@ -1256,13 +1664,16 @@ mod tests {
 
     #[test]
     fn uninstall_report_records_real_failure() {
-        // `storage` exists as a FILE, so remove_dir_all errors with a non-NotFound
+        // `vectors` exists as a FILE, so remove_dir_all errors with a non-NotFound
         // kind and must be recorded — proving we no longer silently swallow it.
+        // (835: this used to seed `sidecar/storage`, a path the sweep no longer
+        // touches because it never existed on a real install — the fixture was
+        // validating the fiction instead of the code.)
         let cfg = TempDir::new().unwrap();
         let data = TempDir::new().unwrap();
         let sidecar = data.path().join("sidecar");
         fs::create_dir_all(&sidecar).unwrap();
-        fs::write(sidecar.join("storage"), b"not-a-dir").unwrap();
+        fs::write(sidecar.join("vectors"), b"not-a-dir").unwrap();
 
         let report = super::reset_paths(cfg.path(), data.path(), true);
         assert!(
@@ -1270,10 +1681,53 @@ mod tests {
             "remove_dir_all on a regular file must be a recorded failure"
         );
         assert!(
-            report.failures.iter().any(|f| f.contains("storage")),
+            report.failures.iter().any(|f| f.contains("vectors")),
             "failure list must name the offending path, got: {:?}",
             report.failures
         );
+    }
+
+    // ── Finding 835: the conversation stores, at their MEASURED paths ─────────
+
+    #[test]
+    fn conversation_dirs_are_the_measured_stores_not_the_phantom() {
+        // Measured on a real macOS install 2026-07-31 and cross-checked against
+        // the sidecar code that writes each store (see `conversation_dirs`).
+        let data = Path::new("/tmp/appdata");
+        let dirs = super::conversation_dirs(data);
+        let expected = [
+            data.join("sidecar").join("data").join("sessions"),
+            data.join("sidecar").join("vectors"),
+            data.join("sidecar")
+                .join("app")
+                .join("storage")
+                .join("memory"),
+            data.join("sidecar")
+                .join("app")
+                .join("storage")
+                .join("vectors"),
+        ];
+        assert_eq!(dirs, expected, "the sweep must target the real layout");
+        // The phantom the old code deleted (a silent no-op) must be gone for good.
+        assert!(
+            !dirs.contains(&data.join("sidecar").join("storage")),
+            "sidecar/storage never existed — it must not be back"
+        );
+    }
+
+    #[test]
+    fn reset_paths_full_removes_the_real_conversation_stores() {
+        let cfg = TempDir::new().unwrap();
+        let data = TempDir::new().unwrap();
+        for dir in super::conversation_dirs(data.path()) {
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("payload"), b"x").unwrap();
+        }
+        let report = super::reset_paths(cfg.path(), data.path(), true);
+        assert!(report.all_ok(), "failures: {:?}", report.failures);
+        for dir in super::conversation_dirs(data.path()) {
+            assert!(!dir.exists(), "must be swept: {}", dir.display());
+        }
     }
 
     // ── Finding B: two-store completion + self-heal (is_complete_at) ───────────
@@ -1441,14 +1895,39 @@ mod tests {
 
     // ── Finding B: selective_reset_paths matrix ───────────────────────────────
 
-    /// Populate a data_dir + config_dir under a fake HOME like a real install.
+    /// Populate a data_dir + config_dir under a fake HOME like a REAL install.
+    ///
+    /// 835: the previous fixture created `sidecar/storage`, a directory that
+    /// exists on no machine — the test then asserted the sweep removed it and
+    /// went green while the user's actual chat history survived. This mirrors
+    /// what was measured on disk on 2026-07-31 (macOS install of 18-20/07):
+    ///
+    /// ```text
+    /// sidecar/data/onboarding.json          sidecar/vectors/memory_v1.db
+    /// sidecar/data/sessions/<uuid>.enc      sidecar/app/storage/system_core.db
+    /// sidecar/data/models/                  sidecar/app/storage/memory/flash/
+    ///                                       sidecar/app/storage/vectors/catalog/
+    /// ```
     fn make_layout(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let data = home.join("data");
         let config = home.join("config");
         let sidecar = data.join("sidecar");
+        let app_storage = sidecar.join("app").join("storage");
         fs::create_dir_all(sidecar.join("data").join("models")).unwrap();
-        fs::create_dir_all(sidecar.join("vectors")).unwrap();
-        fs::create_dir_all(sidecar.join("storage")).unwrap();
+        fs::create_dir_all(sidecar.join("data").join("sessions")).unwrap();
+        fs::write(
+            sidecar
+                .join("data")
+                .join("sessions")
+                .join("485f32fd-d3f5-49f8-be6c-1ad7798c01f7.enc"),
+            b"encrypted-chat",
+        )
+        .unwrap();
+        fs::create_dir_all(sidecar.join("vectors").join("collection")).unwrap();
+        fs::write(sidecar.join("vectors").join("memory_v1.db"), b"sqlite").unwrap();
+        fs::create_dir_all(app_storage.join("memory").join("flash")).unwrap();
+        fs::create_dir_all(app_storage.join("vectors").join("catalog")).unwrap();
+        fs::write(app_storage.join("system_core.db"), b"sqlite").unwrap();
         fs::write(sidecar.join("data").join("onboarding.json"), b"{}").unwrap();
         fs::create_dir_all(&config).unwrap();
         fs::write(config.join("onboarding_complete"), b"1").unwrap();
@@ -1466,8 +1945,13 @@ mod tests {
         let report = super::selective_reset_paths(&config, &data, home.path(), &opts);
         assert!(report.all_ok(), "failures: {:?}", report.failures);
         assert!(!data.join("sidecar").join("data").join("models").exists());
-        assert!(data.join("sidecar").join("vectors").exists());
-        assert!(data.join("sidecar").join("storage").exists());
+        for dir in super::conversation_dirs(&data) {
+            assert!(
+                dir.exists(),
+                "models-only must not touch conversations: {}",
+                dir.display()
+            );
+        }
         assert!(data
             .join("sidecar")
             .join("data")
@@ -1477,22 +1961,42 @@ mod tests {
     }
 
     #[test]
-    fn selective_only_conversations_removes_vectors_and_storage() {
+    fn selective_only_conversations_removes_the_real_stores() {
+        // 835 — the chat history (`data/sessions/*.enc`) and the memory stores
+        // under `app/storage` must actually disappear. The old code removed
+        // `sidecar/vectors` + a non-existent `sidecar/storage`, so the sessions
+        // survived a wipe the modal called "conversations and memory".
         let home = TempDir::new().unwrap();
         let (data, config) = make_layout(home.path());
+        let session = data
+            .join("sidecar")
+            .join("data")
+            .join("sessions")
+            .join("485f32fd-d3f5-49f8-be6c-1ad7798c01f7.enc");
+        assert!(session.exists(), "fixture must seed a real session file");
         let opts = super::UninstallOptions {
             conversations: true,
             ..Default::default()
         };
         let report = super::selective_reset_paths(&config, &data, home.path(), &opts);
         assert!(report.all_ok(), "failures: {:?}", report.failures);
+        assert!(!session.exists(), "the chat history must be gone");
+        for dir in super::conversation_dirs(&data) {
+            assert!(!dir.exists(), "must be swept: {}", dir.display());
+        }
+        // Not conversations: the models, the onboarding state and the system db
+        // survive a conversations-only wipe.
         assert!(data.join("sidecar").join("data").join("models").exists());
-        assert!(!data.join("sidecar").join("vectors").exists());
-        assert!(!data.join("sidecar").join("storage").exists());
         assert!(data
             .join("sidecar")
             .join("data")
             .join("onboarding.json")
+            .exists());
+        assert!(data
+            .join("sidecar")
+            .join("app")
+            .join("storage")
+            .join("system_core.db")
             .exists());
     }
 
@@ -1711,29 +2215,63 @@ mod tests {
         // — same contract as the bundle-owned Library dirs (they carry OUR
         // legacy names, not the bundle id, hence their own test).
         let home = Path::new("/Users/tester");
+        let dirs = super::legacy_leftover_dirs(home);
+        let files = super::legacy_leftover_files(home);
+        // The pre-838 crash dir is modelled on EVERY platform.
+        assert!(
+            dirs.contains(&super::legacy_crash_dir(home)),
+            "the orphaned crash dir must be swept: {:?}",
+            dirs
+        );
         #[cfg(target_os = "macos")]
         {
-            let dirs = super::legacy_leftover_dirs(home);
-            let files = super::legacy_leftover_files(home);
-            assert_eq!(dirs.len(), 2, "Nexe + server.nexe");
+            assert_eq!(dirs.len(), 3, "crash dir + Nexe + server.nexe");
             assert_eq!(files.len(), 1, "the legacy installer plist");
-            for p in dirs.iter().chain(files.iter()) {
-                assert!(p.starts_with(home), "home-scoped: {}", p.display());
-                assert!(
-                    super::is_safe_to_remove(p, home, &[p.as_path()]),
-                    "guard must accept the legacy path: {}",
-                    p.display()
-                );
-            }
             assert!(files[0]
                 .to_string_lossy()
                 .ends_with("net.jgoy.nexe-installer.plist"));
         }
         #[cfg(not(target_os = "macos"))]
         {
-            assert!(super::legacy_leftover_dirs(home).is_empty());
-            assert!(super::legacy_leftover_files(home).is_empty());
+            assert_eq!(dirs.len(), 1, "only the crash dir off macOS");
+            assert!(files.is_empty());
         }
+        for p in dirs.iter().chain(files.iter()) {
+            assert!(p.starts_with(home), "home-scoped: {}", p.display());
+            assert!(
+                super::is_safe_to_remove(p, home, &[p.as_path()]),
+                "guard must accept the legacy path: {}",
+                p.display()
+            );
+        }
+    }
+
+    #[test]
+    fn full_wipe_sweeps_the_orphaned_crash_dir() {
+        // 838 — every build before this commit wrote 0600 stack traces to
+        // `<data_local>/nexe-app/crashes`, outside the bundle id and therefore
+        // outside every sweep. main.rs now writes under `com.nexe.app/`, and the
+        // full wipe collects the orphan those older builds left behind.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let crash_dir = super::legacy_crash_dir(home).join("crashes");
+        fs::create_dir_all(&crash_dir).unwrap();
+        fs::write(crash_dir.join("crash-1-2.txt"), b"stack trace").unwrap();
+        let data_dir = home.join("data");
+        let config_dir = home.join("config");
+        fs::create_dir_all(&data_dir).unwrap();
+        fs::create_dir_all(&config_dir).unwrap();
+
+        let opts = super::UninstallOptions {
+            library: true,
+            ..Default::default()
+        };
+        let report = super::selective_reset_paths(&config_dir, &data_dir, home, &opts);
+        assert!(report.all_ok(), "sweep failed: {:?}", report.failures);
+        assert!(
+            !super::legacy_crash_dir(home).exists(),
+            "the pre-838 crash dir must be swept"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1766,6 +2304,7 @@ mod tests {
             conversations: false,
             ollama: false,
             embeddings_cache: false,
+            uninstall_app: false,
         };
         // NOTE: legacy paths derive from the REAL home in production; here we
         // pass tmp as home so the sweep's derived paths land inside the tmp.
@@ -1913,5 +2452,277 @@ mod tests {
             "la credencial ha sobreviscut al delete: {}",
             String::from_utf8_lossy(&after.stdout)
         );
+    }
+
+    // ── Findings 830 / 836: two independent questions, one closing message ────
+
+    #[test]
+    fn any_data_ignores_the_app_checkbox() {
+        // The two halves must never leak into each other: ticking ONLY "uninstall
+        // the app" must not make the command believe a data wipe was requested.
+        let app_only = super::UninstallOptions {
+            uninstall_app: true,
+            ..Default::default()
+        };
+        assert!(!app_only.any_data());
+        let data_only = super::UninstallOptions {
+            conversations: true,
+            ..Default::default()
+        };
+        assert!(data_only.any_data());
+        assert!(!data_only.uninstall_app);
+        assert!(!super::UninstallOptions::default().any_data());
+    }
+
+    #[test]
+    fn options_deserialize_the_app_flag_and_default_to_false() {
+        // `#[serde(default)]` fail-safe: a malformed/legacy IPC payload must
+        // never arm the app removal.
+        let empty: super::UninstallOptions = serde_json::from_str("{}").unwrap();
+        assert!(!empty.uninstall_app && !empty.any_data());
+        let legacy: super::UninstallOptions =
+            serde_json::from_str(r#"{"models":true,"conversations":true}"#).unwrap();
+        assert!(!legacy.uninstall_app, "legacy payload must not uninstall");
+        let armed: super::UninstallOptions =
+            serde_json::from_str(r#"{"uninstall_app":true}"#).unwrap();
+        assert!(armed.uninstall_app && !armed.any_data());
+    }
+
+    #[test]
+    fn data_summary_always_states_the_app_survives() {
+        // 830: the gate that only erases DATA must say so, in both modes.
+        let full = super::data_summary(&super::UninstallOptions {
+            library: true,
+            ..Default::default()
+        });
+        assert!(
+            full.contains("stays installed"),
+            "full wipe gate must say the app survives: {full}"
+        );
+        let partial = super::data_summary(&super::UninstallOptions {
+            models: true,
+            ..Default::default()
+        });
+        assert!(
+            partial.contains("stays installed"),
+            "per-category gate must say the app survives: {partial}"
+        );
+        assert_eq!(
+            super::data_summary(&super::UninstallOptions::default()),
+            "• (nothing selected)"
+        );
+    }
+
+    #[test]
+    fn app_removal_summary_names_the_artifact_or_the_reason() {
+        let removable = super::AppArtifact::SelfRemovable(std::path::PathBuf::from(
+            "/Applications/nexe-app.app",
+        ));
+        let s = super::app_removal_summary(&removable);
+        assert!(s.contains("/Applications/nexe-app.app"));
+        let blocked = super::AppArtifact::NotSelfRemovable("packaged install");
+        let s = super::app_removal_summary(&blocked);
+        assert!(s.contains("CANNOT be removed") && s.contains("packaged install"));
+    }
+
+    #[test]
+    fn completion_message_tells_the_truth_of_each_half() {
+        // 836: the app used to quit silently mid-wipe ("sembla que tomba").
+        let ok = super::UninstallReport::default();
+
+        let data_only = super::completion_message(&ok, true, None);
+        assert!(data_only.contains("Dades esborrades correctament"));
+        assert!(
+            data_only.contains("stays installed and usable"),
+            "830: a data-only wipe must say the app is still there: {data_only}"
+        );
+
+        let mut failed = super::UninstallReport::default();
+        failed.failures.push("/tmp/x: boom".to_string());
+        let msg = super::completion_message(&failed, true, None);
+        assert!(
+            !msg.contains("Dades esborrades correctament"),
+            "a failed sweep must not claim success: {msg}"
+        );
+        assert!(
+            msg.contains("/tmp/x: boom"),
+            "failures must be named: {msg}"
+        );
+
+        let scheduled = super::AppRemovalOutcome::Scheduled(std::path::PathBuf::from(
+            "/Applications/nexe-app.app",
+        ));
+        let msg = super::completion_message(&ok, true, Some(&scheduled));
+        assert!(msg.contains("/Applications/nexe-app.app"));
+        assert!(!msg.contains("stays installed and usable"));
+
+        let skipped = super::AppRemovalOutcome::Skipped("packaged install".to_string());
+        let msg = super::completion_message(&ok, false, Some(&skipped));
+        assert!(msg.contains("NOT removed") && msg.contains("packaged install"));
+        assert!(
+            !msg.contains("Dades esborrades correctament"),
+            "app-only uninstall must not claim a data wipe: {msg}"
+        );
+    }
+
+    // ── The self-removal mechanism (only where it exists) ─────────────────────
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    mod self_removal {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use tempfile::TempDir;
+
+        /// A target the platform guard accepts, inside a tempdir. NEVER a real
+        /// install path: these tests arm a real `rm -rf`.
+        fn make_target(tmp: &Path) -> PathBuf {
+            let target = tmp.join(format!("nexe-app{}", super::super::APP_ARTIFACT_SUFFIX));
+            #[cfg(target_os = "macos")]
+            {
+                fs::create_dir_all(target.join("Contents").join("MacOS")).unwrap();
+                fs::write(target.join("Contents").join("Info.plist"), b"<plist/>").unwrap();
+            }
+            #[cfg(target_os = "linux")]
+            {
+                fs::write(&target, b"\x7fELF").unwrap();
+            }
+            target
+        }
+
+        #[test]
+        fn guard_accepts_only_a_plausible_artifact() {
+            let ok = PathBuf::from(format!(
+                "/Applications/nexe-app{}",
+                super::super::APP_ARTIFACT_SUFFIX
+            ));
+            assert!(super::super::is_safe_app_artifact(&ok));
+            // Relative → would resolve against the helper's cwd.
+            assert!(!super::super::is_safe_app_artifact(Path::new(
+                "nexe-app.app"
+            )));
+            // Traversal.
+            assert!(!super::super::is_safe_app_artifact(&PathBuf::from(
+                format!(
+                    "/Applications/../etc/nexe-app{}",
+                    super::super::APP_ARTIFACT_SUFFIX
+                )
+            )));
+            // Wrong (or missing) suffix — a bare dir name can never qualify.
+            assert!(!super::super::is_safe_app_artifact(Path::new(
+                "/Applications/nexe-app"
+            )));
+            assert!(!super::super::is_safe_app_artifact(Path::new("/")));
+            // Root-level artifact: refused rather than nuked.
+            assert!(!super::super::is_safe_app_artifact(&PathBuf::from(
+                format!("/nexe-app{}", super::super::APP_ARTIFACT_SUFFIX)
+            )));
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn artifact_is_the_nearest_app_bundle() {
+            use super::super::{app_artifact, AppArtifact};
+            assert_eq!(
+                app_artifact(
+                    Path::new("/Applications/nexe-app.app/Contents/MacOS/nexe-app"),
+                    None
+                ),
+                AppArtifact::SelfRemovable(PathBuf::from("/Applications/nexe-app.app"))
+            );
+            // A dev run (cargo target dir) is not a bundle — nothing to delete.
+            assert!(matches!(
+                app_artifact(Path::new("/Users/x/p/target/debug/nexe-app"), None),
+                AppArtifact::NotSelfRemovable(_)
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn artifact_comes_from_the_appimage_runtime_only() {
+            use super::super::{app_artifact, AppArtifact};
+            let exe = Path::new("/tmp/.mount_nexeXX/usr/bin/nexe-app");
+            assert_eq!(
+                app_artifact(exe, Some(Path::new("/home/u/Desktop/nexe-app.AppImage"))),
+                AppArtifact::SelfRemovable(PathBuf::from("/home/u/Desktop/nexe-app.AppImage"))
+            );
+            // A .deb install exports no APPIMAGE → the package manager owns it.
+            assert!(matches!(
+                app_artifact(Path::new("/usr/bin/nexe-app"), None),
+                AppArtifact::NotSelfRemovable(_)
+            ));
+            // A bogus APPIMAGE value never becomes a removal target.
+            assert!(matches!(
+                app_artifact(exe, Some(Path::new("/etc"))),
+                AppArtifact::NotSelfRemovable(_)
+            ));
+        }
+
+        #[test]
+        fn sh_quote_survives_spaces_and_quotes() {
+            assert_eq!(super::super::sh_quote("/A B/x.app"), "'/A B/x.app'");
+            assert_eq!(
+                super::super::sh_quote("/it's/x.app"),
+                "'/it'\\''s/x.app'",
+                "an embedded quote must not break out of the literal"
+            );
+        }
+
+        #[test]
+        fn script_waits_for_the_pid_and_only_then_removes() {
+            let script = super::super::self_delete_script(Path::new("/A B/nexe.app"), 4242);
+            assert!(
+                script.contains("kill -0 4242"),
+                "must watch our pid: {script}"
+            );
+            assert!(
+                script.contains("kill -0 4242 2>/dev/null || rm -rf -- '/A B/nexe.app'"),
+                "the removal must be CONDITIONAL on the pid being gone: {script}"
+            );
+            assert!(
+                script.contains("[ $i -lt 300 ]"),
+                "the wait must be bounded: {script}"
+            );
+        }
+
+        #[test]
+        fn spawn_refuses_an_unsafe_target_and_touches_nothing() {
+            let tmp = TempDir::new().unwrap();
+            let victim = tmp.path().join("not-an-artifact");
+            fs::create_dir_all(&victim).unwrap();
+            let err = super::super::spawn_self_delete(&victim, std::process::id())
+                .expect_err("the guard must refuse a target without the artifact suffix");
+            assert!(err.contains("refused"), "{err}");
+            assert!(victim.exists(), "nothing may be scheduled for removal");
+        }
+
+        #[test]
+        fn self_delete_removes_the_target_once_the_pid_is_gone() {
+            // The REAL mechanism, end to end, against a tempdir: arm the remover
+            // on a throwaway pid, kill it, and watch the artifact disappear.
+            let tmp = TempDir::new().unwrap();
+            let target = make_target(tmp.path());
+            let mut victim_pid = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("sh must be spawnable");
+            super::super::spawn_self_delete(&target, victim_pid.id()).expect("armed");
+            assert!(target.exists(), "still alive → nothing removed yet");
+            victim_pid.kill().unwrap();
+            victim_pid.wait().unwrap(); // reap: the pid is now really gone
+
+            let mut gone = false;
+            for _ in 0..100 {
+                if !target.exists() {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(gone, "the remover must delete {} ", target.display());
+        }
     }
 }

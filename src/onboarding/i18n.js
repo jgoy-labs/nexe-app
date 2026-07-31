@@ -70,23 +70,34 @@ const STRINGS = {
     btn_reset_install: "Reinicia la instal·lació…",
     reset_install_confirm: "Això esborrarà la instal·lació existent i reiniciarà el procés des de zero. Continua?",
     uninstall_title: "Desinstal·lar server-nexe",
-    uninstall_intro: "Tria què vols esborrar. En confirmar, l'aplicació es tancarà.",
+    uninstall_intro:
+      "Són dues coses diferents i pots triar-ne una, l'altra o totes dues. Cadascuna et demanarà la seva confirmació. En acabar, l'aplicació es tancarà.",
+    uninstall_section_data: "Esborra les meves dades",
+    uninstall_section_data_desc:
+      "Converses, configuració, models i caché. L'app segueix instal·lada i utilitzable.",
+    uninstall_section_app: "Desinstal·la nexe",
+    uninstall_section_app_desc:
+      "Treu l'aplicació de l'ordinador. Les teves dades només s'esborren si també marques la casella de dades.",
+    uninstall_opt_app: "Desinstal·la l'aplicació",
+    uninstall_opt_app_desc:
+      "Esborra l'aplicació del disc (macOS: el paquet .app · Linux: l'AppImage) i les nostres claus del Keychain / Gestor de credencials. A Windows, fes servir el desinstal·lador del sistema.",
     uninstall_opt_models: "Models descarregats",
     uninstall_opt_models_desc: "Els fitxers dels models d'IA baixats.",
     uninstall_opt_conversations: "Converses i memòria",
     uninstall_opt_conversations_desc: "Historial de xat i memòria persistent (vectors + base de dades).",
     uninstall_opt_library: "Configuració, claus i estat",
-    uninstall_opt_library_desc: "Ho esborra tot i deixa l'app com acabada d'instal·lar.",
+    uninstall_opt_library_desc:
+      "Esborra totes les dades i deixa l'app com acabada d'instal·lar. NO desinstal·la l'aplicació.",
     uninstall_opt_ollama: "Models d'Ollama",
     uninstall_opt_ollama_desc: "Compartits amb altres apps (~/.ollama). No es marca per defecte.",
     uninstall_opt_embeddings: "Cau d'embeddings",
     uninstall_opt_embeddings_desc:
       "Model de cerca semàntica descarregat (~/.cache/fastembed, ~1 GB). S'esborra sempre amb «ho esborra tot».",
-    uninstall_select_all: "Esborra-ho tot i surt",
+    uninstall_select_all: "Esborra-ho tot i desinstal·la",
     uninstall_btn_cancel: "Cancel·la",
     uninstall_btn_confirm: "Desinstal·la",
     uninstall_warn: "Atenció: aquesta acció no es pot desfer.",
-    uninstall_closing: "Confirma al diàleg… l'aplicació es tancarà.",
+    uninstall_closing: "Confirma als diàlegs que apareixeran; l'aplicació es tancarà en acabar.",
     uninstall_nothing: "Selecciona almenys una opció.",
   },
   es: {
@@ -156,23 +167,34 @@ const STRINGS = {
     btn_reset_install: "Reiniciar la instalación…",
     reset_install_confirm: "Esto borrará la instalación existente y reiniciará el proceso desde cero. ¿Continuar?",
     uninstall_title: "Desinstalar server-nexe",
-    uninstall_intro: "Elige qué quieres borrar. Al confirmar, la aplicación se cerrará.",
+    uninstall_intro:
+      "Son dos cosas distintas y puedes elegir una, la otra o ambas. Cada una te pedirá su propia confirmación. Al terminar, la aplicación se cerrará.",
+    uninstall_section_data: "Borra mis datos",
+    uninstall_section_data_desc:
+      "Conversaciones, configuración, modelos y caché. La app sigue instalada y utilizable.",
+    uninstall_section_app: "Desinstala nexe",
+    uninstall_section_app_desc:
+      "Quita la aplicación del ordenador. Tus datos solo se borran si también marcas la casilla de datos.",
+    uninstall_opt_app: "Desinstala la aplicación",
+    uninstall_opt_app_desc:
+      "Borra la aplicación del disco (macOS: el paquete .app · Linux: el AppImage) y nuestras claves del Keychain / Administrador de credenciales. En Windows, usa el desinstalador del sistema.",
     uninstall_opt_models: "Modelos descargados",
     uninstall_opt_models_desc: "Los archivos de los modelos de IA descargados.",
     uninstall_opt_conversations: "Conversaciones y memoria",
     uninstall_opt_conversations_desc: "Historial de chat y memoria persistente (vectores + base de datos).",
     uninstall_opt_library: "Configuración, claves y estado",
-    uninstall_opt_library_desc: "Lo borra todo y deja la app como recién instalada.",
+    uninstall_opt_library_desc:
+      "Borra todos los datos y deja la app como recién instalada. NO desinstala la aplicación.",
     uninstall_opt_ollama: "Modelos de Ollama",
     uninstall_opt_ollama_desc: "Compartidos con otras apps (~/.ollama). No se marca por defecto.",
     uninstall_opt_embeddings: "Caché de embeddings",
     uninstall_opt_embeddings_desc:
       "Modelo de búsqueda semántica descargado (~/.cache/fastembed, ~1 GB). Se borra siempre con «lo borra todo».",
-    uninstall_select_all: "Bórralo todo y salir",
+    uninstall_select_all: "Bórralo todo y desinstala",
     uninstall_btn_cancel: "Cancelar",
     uninstall_btn_confirm: "Desinstalar",
     uninstall_warn: "Atención: esta acción no se puede deshacer.",
-    uninstall_closing: "Confirma en el diálogo… la aplicación se cerrará.",
+    uninstall_closing: "Confirma en los diálogos que aparecerán; la aplicación se cerrará al terminar.",
     uninstall_nothing: "Selecciona al menos una opción.",
   },
   en: {
@@ -242,23 +264,34 @@ const STRINGS = {
     btn_reset_install: "Reset installation…",
     reset_install_confirm: "This will delete the existing installation and restart the setup from scratch. Continue?",
     uninstall_title: "Uninstall server-nexe",
-    uninstall_intro: "Choose what to remove. On confirm, the app will close.",
+    uninstall_intro:
+      "These are two different things and you can pick either, or both. Each one asks for its own confirmation. When it is done, the app will close.",
+    uninstall_section_data: "Erase my data",
+    uninstall_section_data_desc:
+      "Conversations, configuration, models and cache. The app stays installed and usable.",
+    uninstall_section_app: "Uninstall nexe",
+    uninstall_section_app_desc:
+      "Removes the application from your computer. Your data is only erased if you also tick the data box.",
+    uninstall_opt_app: "Uninstall the application",
+    uninstall_opt_app_desc:
+      "Removes the application from disk (macOS: the .app bundle · Linux: the AppImage) and our entries in the Keychain / Credential Manager. On Windows, use the system uninstaller.",
     uninstall_opt_models: "Downloaded models",
     uninstall_opt_models_desc: "The downloaded AI model files.",
     uninstall_opt_conversations: "Conversations and memory",
     uninstall_opt_conversations_desc: "Chat history and persistent memory (vectors + database).",
     uninstall_opt_library: "Configuration, keys and state",
-    uninstall_opt_library_desc: "Removes everything, leaving the app as freshly installed.",
+    uninstall_opt_library_desc:
+      "Removes all data, leaving the app as freshly installed. It does NOT uninstall the application.",
     uninstall_opt_ollama: "Ollama models",
     uninstall_opt_ollama_desc: "Shared with other apps (~/.ollama). Unchecked by default.",
     uninstall_opt_embeddings: "Embeddings cache",
     uninstall_opt_embeddings_desc:
       'Downloaded semantic-search model (~/.cache/fastembed, ~1 GB). Always removed by the "removes everything" option.',
-    uninstall_select_all: "Erase everything and quit",
+    uninstall_select_all: "Erase everything and uninstall",
     uninstall_btn_cancel: "Cancel",
     uninstall_btn_confirm: "Uninstall",
     uninstall_warn: "Warning: this action cannot be undone.",
-    uninstall_closing: "Confirm in the dialog… the app will close.",
+    uninstall_closing: "Confirm in the dialogs that appear; the app will close when done.",
     uninstall_nothing: "Select at least one option.",
   },
 };
