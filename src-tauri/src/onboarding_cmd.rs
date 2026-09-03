@@ -2819,7 +2819,9 @@ mod tests {
             "must watch our pid: {script}"
         );
         assert!(
-            script.contains(r#"|| (rmdir /s /q "C:\Users\u\AppData\Local\com.nexe.app" & exit /b 0)"#),
+            script.contains(
+                r#"|| (rmdir /s /q "C:\Users\u\AppData\Local\com.nexe.app" & exit /b 0)"#
+            ),
             "the removal must be CONDITIONAL on the pid being gone: {script}"
         );
         assert!(
