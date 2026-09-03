@@ -287,6 +287,25 @@ if [ -n "$APP_SOURCE_DIR" ]; then
     # loaded into Qdrant at first boot) and the source docs the RAG serves. Adding
     # knowledge/ here would silently break RAG (docs never load, no visible error).
     #
+    # ── Verify precomputed embeddings manifest (#939) ──────────────────
+    # The CI step (ci.yml) runs `precompute_kb.py --verify` with
+    # continue-on-error=true — soft on purpose, so a small knowledge edit
+    # between builds never blocks a PR. THIS is the authoritative check: the
+    # manifest travels inside knowledge/ into the bundle above, so a stale
+    # one means broken/missing RAG docs shipped to users with no error at
+    # install time. Runs before the (possibly slow) copy so a stale manifest
+    # fails fast.
+    if [ -f "$APP_SOURCE_DIR/knowledge/.embeddings/manifest.json" ]; then
+        echo "==> Verifying precomputed embeddings manifest..."
+        if ! "$APP_SOURCE_DIR/venv/bin/python3" "$APP_SOURCE_DIR/scripts/precompute_kb.py" --verify; then
+            echo "ERROR: precomputed embeddings manifest is stale or invalid — RAG would ship broken/missing docs." >&2
+            echo "Regenerate with: (cd $APP_SOURCE_DIR && venv/bin/python3 scripts/precompute_kb.py)" >&2
+            exit 1
+        fi
+    else
+        echo "WARNING: no precomputed embeddings manifest at $APP_SOURCE_DIR/knowledge/.embeddings/manifest.json — RAG will use the runtime fallback." >&2
+    fi
+    #
     # Leading slash in /pattern = anchored to $APP_SOURCE_DIR; without a slash it
     # matches at any depth (which is why, without a slash, it also excludes
     # memory/memory/storage/, a real Python module that we do NOT want excluded).
@@ -297,9 +316,10 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         cp -R "$APP_SOURCE_DIR/." "$SIDECAR_DIR/app/"
         ( cd "$SIDECAR_DIR/app" && rm -rf \
             storage .env .git diari tests InstallNexe.app Nexe.app .internal-audit dev-tools \
+            _tmp findings.db \
             .test_venv .venv .test_data worktrees .github .grimp_cache .ruff_cache \
             node_modules .pytest_cache .mypy_cache .coverage docs specialists scripts \
-            SetupNexe.command setup.sh nexe eslint.config.js package.json package-lock.json \
+            SetupNexe.command setup.sh eslint.config.js package.json package-lock.json \
             pytest.ini pytest-full.ini conftest.py .module_cache.json \
             installer/swift-wizard installer/NexeTray.app installer/tray_icons \
             installer/build_dmg.sh installer/build-embedding-bundle.sh \
@@ -311,7 +331,8 @@ if [ -n "$APP_SOURCE_DIR" ]; then
             installer/dmg_background.png installer/logo.png \
             installer/ollama-checksums.txt installer/wheels-checksums.txt 2>/dev/null || true
           rm -rf README*.md CHANGELOG.md LICENSE SECURITY.md THREAT_MODEL.md \
-            CODE_OF_CONDUCT.md CONTRIBUTING.md COMMANDS.md index_server-nexe.md 2>/dev/null || true
+            CODE_OF_CONDUCT.md CONTRIBUTING.md index_server-nexe.md 2>/dev/null || true
+          rm -rf plugins/web_ui_module/ui/uploads/* 2>/dev/null || true
           find . -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
           find . -type d -name '*.egg-info' -exec rm -rf {} + 2>/dev/null || true
           find . -name '.DS_Store' -delete 2>/dev/null || true
@@ -325,19 +346,20 @@ if [ -n "$APP_SOURCE_DIR" ]; then
         --exclude='/.internal-audit' --exclude='/dev-tools' \
         --exclude='/.test_venv' --exclude='/.venv' \
         --exclude='/.test_data' --exclude='/worktrees' \
+        --exclude='/_tmp' --exclude='/findings.db' \
+        --exclude='/plugins/web_ui_module/ui/uploads/**' \
         --exclude='/.github' --exclude='/.grimp_cache' --exclude='/.ruff_cache' \
         --exclude='/node_modules' --exclude='/.pytest_cache' --exclude='/.mypy_cache' \
         --exclude='/.coverage' --exclude='.DS_Store' --exclude='._*' \
         --exclude='/docs' --exclude='/specialists' \
         --exclude='/scripts' --exclude='/SetupNexe.command' --exclude='/setup.sh' \
-        --exclude='/nexe' \
         --exclude='/eslint.config.js' --exclude='/package.json' --exclude='/package-lock.json' \
         --exclude='/pytest.ini' --exclude='/pytest-full.ini' --exclude='/conftest.py' \
         --exclude='*.egg-info' \
         --exclude='/README*.md' --exclude='/CHANGELOG.md' --exclude='/LICENSE' \
         --exclude='/SECURITY.md' --exclude='/THREAT_MODEL.md' \
         --exclude='/CODE_OF_CONDUCT.md' --exclude='/CONTRIBUTING.md' \
-        --exclude='/COMMANDS.md' --exclude='/index_server-nexe.md' \
+        --exclude='/index_server-nexe.md' \
         --exclude='.module_cache.json' \
         --exclude='/installer/swift-wizard' \
         --exclude='/installer/NexeTray.app' \
@@ -378,6 +400,17 @@ if [ -n "$APP_SOURCE_DIR" ]; then
     # and the standalone CLI (install.py + install_headless.py). Everything has an
     # equivalent in nexe-app/Tauri (wizard HTML + native tray + its own scripts).
     echo "    Source dir: $APP_SOURCE_DIR"
+
+    # ── Step 4.1: privacy gate BY NATURE, right here (#930) ───────────────
+    # This is the only moment the question has an exact answer: app/ holds the
+    # copy and nothing else has been generated inside it yet, so everything
+    # there must be tracked by the repo. Ten lines further down the build
+    # starts placing artefacts and the check would need a list of exceptions —
+    # which is the enumeration that let _tmp/, findings.db and four test
+    # uploads travel in the first place. The gate runs again at the end
+    # (denylist) over the finished bundle; this run is the one that catches
+    # the file nobody thought of.
+    "$SCRIPT_DIR/verify-privacy-gate.sh" "$SIDECAR_DIR/app" "$APP_SOURCE_DIR" || exit 1
 else
     # Single-file mode (poc-sidecar default): copy one .py file as app.py.
     cp "$SCRIPT_DIR/$APP_MODULE" "$SIDECAR_DIR/app/app.py"

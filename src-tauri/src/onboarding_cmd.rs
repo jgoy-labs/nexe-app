@@ -269,6 +269,82 @@ fn remove_dir_tracked(report: &mut UninstallReport, path: &std::path::Path) {
     }
 }
 
+/// Which dir (if any) can only be removed once THIS process is gone (828).
+///
+/// Pure — no filesystem effects — so the closing message can tell the truth
+/// before anything is armed, the same split `plan_app_removal` uses.
+///
+/// On Windows `%LOCALAPPDATA%\com.nexe.app` holds `EBWebView`, the user-data
+/// folder of our OWN live WebView2. The wipe runs before `app.exit(0)`, so that
+/// handle is held by a process that is still running by design: the retry loop
+/// in `remove_dir_all_resilient` cannot ever win it, and the dir fails with
+/// `os error 32` (sharing violation) while the rest of the wipe succeeds.
+/// Retrying harder is not the answer — waiting for our own death is.
+///
+/// Returns `None` off Windows (POSIX unlinks an open path just fine, and the
+/// Linux equivalent was measured REFUTED on 17/07: WebKitGTK's cache lives
+/// inside the dir the library wipe already removes).
+fn plan_deferred_cache_delete(home: &Path, library_wipe_confirmed: bool) -> Option<PathBuf> {
+    if !library_wipe_confirmed {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        library_data_dirs(home).into_iter().find(|d| d.exists())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = home;
+        None
+    }
+}
+
+/// The detached cmd.exe script: wait (bounded) for `pid` to die, then `rmdir`
+/// ONLY if it is really gone. Pure so the contract is unit-tested on every OS;
+/// spawn itself is Windows-only.
+///
+/// 60 × ~1 s (`ping -n 2`) = 60 s, same budget as `self_delete_script`. The
+/// delay MUST sit inside the `do` body: putting `& timeout` after the `for`
+/// (the first #828 script) ran 120 tight `tasklist` polls, then one timeout,
+/// then exited — nexe was still alive, `rmdir` never ran, EBWebView stayed.
+/// `ping` not `timeout.exe`: timeout fails when stdin is redirected /
+/// CREATE_NO_WINDOW ("Input redirection is not supported"). Quoting: the path
+/// goes inside "" and Windows paths cannot contain a literal quote.
+#[cfg(any(test, windows))]
+fn deferred_dir_delete_script(target: &Path, pid: u32) -> String {
+    format!(
+        "for /l %i in (1,1,60) do (tasklist /FI \"PID eq {pid}\" | find \"{pid}\" >nul || (rmdir /s /q \"{}\" & exit /b 0) & ping 127.0.0.1 -n 2 >nul)",
+        target.display()
+    )
+}
+
+/// Arm the deferred removal of a dir this process holds open (828).
+///
+/// Windows counterpart of `spawn_self_delete`: a detached `cmd.exe` polls until
+/// `pid` is gone, then removes the tree. Same contract — it MUST be armed after
+/// the user's ack (#836), and a failed spawn is reported, never swallowed.
+#[cfg(windows)]
+fn spawn_deferred_dir_delete(target: &Path, pid: u32) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // The guard the sweep itself uses: this ends up inside a `rmdir /s /q`.
+    let home = home_dir_or_default();
+    if !is_safe_to_remove(target, &home, &[target]) {
+        return Err(format!(
+            "{}: refused (unsafe path — guard)",
+            target.display()
+        ));
+    }
+    std::process::Command::new("cmd.exe")
+        .args(["/C", &deferred_dir_delete_script(target, pid)])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", target.display()))
+}
+
 /// The REAL on-disk homes of the user's conversations and persistent memory,
 /// derived from `data_dir` (`app_data_dir()`).
 ///
@@ -634,6 +710,8 @@ fn legacy_crash_dir(home: &Path) -> PathBuf {
 
 fn legacy_leftover_dirs(home: &Path) -> Vec<PathBuf> {
     // The pre-fix crash-report dir exists on every platform (finding 838).
+    // Only the macOS block below pushes, so `mut` is unused elsewhere.
+    #[allow(unused_mut)]
     let mut dirs = vec![legacy_crash_dir(home)];
     #[cfg(target_os = "macos")]
     {
@@ -681,9 +759,10 @@ fn legacy_leftover_files(home: &Path) -> Vec<PathBuf> {
 //     this repo returns ZERO hits — nexe-app installs none. The plists present on
 //     a developer machine (`com.jgoy.*`) belong to the USER, and deleting an agent
 //     we never created would be destroying their configuration.
-//   - Windows. The bundle is installed by an NSIS/MSI installer that owns its own
-//     uninstall entry; self-deleting around it would fight the package database.
-//     The dialog says so instead of pretending.
+//   - Windows. We do not self-delete the install tree (that would fight the
+//     NSIS package database). After the user's ack we launch `uninstall.exe`
+//     next to the exe (#830) and, on a library wipe, a cmd.exe helper that
+//     waits for our pid and then removes `%LOCALAPPDATA%\com.nexe.app` (#828).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Suffix the app artifact must carry on this platform for the guard to accept
@@ -698,6 +777,10 @@ const APP_ARTIFACT_SUFFIX: &str = ".AppImage";
 pub enum AppArtifact {
     /// A single path that may be deleted once this process is gone.
     SelfRemovable(PathBuf),
+    /// We cannot delete ourselves, but the installer left a real uninstaller
+    /// next to the executable (Windows/NSIS). Ticking the box hands over to it
+    /// instead of doing nothing (830).
+    ExternalUninstaller(PathBuf),
     /// We are not the owner of the installed files — the reason is shown to the
     /// user verbatim so the modal never claims a removal it cannot perform.
     NotSelfRemovable(&'static str),
@@ -739,11 +822,54 @@ fn app_artifact(exe: &Path, appimage: Option<&Path>) -> AppArtifact {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = (exe, appimage);
-        AppArtifact::NotSelfRemovable(
-            "use the Windows uninstaller (Apps & features) / fes servir el desinstal·lador de Windows",
-        )
+        let _ = appimage; // no AppImage off Linux
+                          // 830: NSIS drops uninstall.exe next to the executable it installs, so
+                          // the running exe's own directory locates it for both a per-user and a
+                          // per-machine install — no registry read, no hardcoded %LOCALAPPDATA%.
+        match exe.parent().map(|d| d.join(EXTERNAL_UNINSTALLER_NAME)) {
+            Some(u) if is_safe_external_uninstaller(&u) && u.is_file() => {
+                AppArtifact::ExternalUninstaller(u)
+            }
+            _ => AppArtifact::NotSelfRemovable(
+                "no uninstaller found next to the executable — use Apps & features / no s'ha trobat el desinstal·lador: fes servir Aplicacions i característiques",
+            ),
+        }
     }
+}
+
+/// The file NSIS writes beside the installed executable.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const EXTERNAL_UNINSTALLER_NAME: &str = "uninstall.exe";
+
+/// Guard for the ONE binary we are allowed to launch on the user's behalf.
+/// Same philosophy as [`is_safe_app_artifact`]: the path is derived from
+/// `current_exe()`, but it still ends up as an argument to a process spawn, so
+/// it is checked rather than trusted. All of:
+///   (1) absolute — a relative path would resolve against the spawner's cwd;
+///   (2) no `..` component — a traversal could point anywhere;
+///   (3) named exactly `uninstall.exe` — never an arbitrary neighbour binary;
+///   (4) at least two components below the root, so a root-level dropper
+///       (`C:\uninstall.exe`) is refused rather than run.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn is_safe_external_uninstaller(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return false;
+    }
+    let named = path
+        .file_name()
+        .map(|n| n.eq_ignore_ascii_case(EXTERNAL_UNINSTALLER_NAME))
+        .unwrap_or(false);
+    let depth = path
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    named && depth >= 2
 }
 
 /// Paranoid guard for the ONE path the self-delete helper is allowed to touch.
@@ -824,35 +950,100 @@ fn spawn_self_delete(target: &Path, pid: u32) -> Result<(), String> {
 pub enum AppRemovalOutcome {
     /// The remover is armed; `PathBuf` disappears once this process exits.
     Scheduled(PathBuf),
+    /// The platform's own uninstaller will be launched as we close (830).
+    /// Unlike `Scheduled` the removal is not silent: the user finishes it.
+    HandOff(PathBuf),
     /// Nothing was armed, and why (shown verbatim).
     Skipped(String),
 }
 
-/// Arm the removal of the running app. Reads the two environment facts
-/// (`current_exe()`, `$APPIMAGE`) and delegates every decision to the pure
-/// helpers above.
-fn schedule_app_removal() -> AppRemovalOutcome {
-    let exe = match std::env::current_exe() {
-        Ok(p) => p,
-        Err(e) => return AppRemovalOutcome::Skipped(format!("current_exe failed: {e}")),
-    };
-    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
-    match app_artifact(&exe, appimage.as_deref()) {
-        AppArtifact::NotSelfRemovable(reason) => AppRemovalOutcome::Skipped(reason.to_string()),
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        AppArtifact::SelfRemovable(target) => {
-            match spawn_self_delete(&target, std::process::id()) {
-                Ok(()) => AppRemovalOutcome::Scheduled(target),
-                Err(e) => AppRemovalOutcome::Skipped(e),
-            }
+/// Decide what WOULD happen to the app artifact — pure, no filesystem or
+/// process effects. Takes the `AppArtifact` already resolved before the
+/// confirmation dialog (#836: recomputing it here used to double as the arm
+/// trigger, coupling "what to tell the user" with "start the 60s clock").
+fn plan_app_removal(artifact: Option<&AppArtifact>) -> AppRemovalOutcome {
+    match artifact {
+        None => AppRemovalOutcome::Skipped("app removal not requested".to_string()),
+        Some(AppArtifact::NotSelfRemovable(reason)) => {
+            AppRemovalOutcome::Skipped(reason.to_string())
         }
+        Some(AppArtifact::ExternalUninstaller(u)) => AppRemovalOutcome::HandOff(u.clone()),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        Some(AppArtifact::SelfRemovable(target)) => AppRemovalOutcome::Scheduled(target.clone()),
         // Windows/other never yield SelfRemovable — the arm is unreachable there.
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        AppArtifact::SelfRemovable(target) => AppRemovalOutcome::Skipped(format!(
+        Some(AppArtifact::SelfRemovable(target)) => AppRemovalOutcome::Skipped(format!(
             "{}: self-removal is not implemented on this platform",
             target.display()
         )),
     }
+}
+
+/// Actually arm the remover for a `Scheduled` plan. #836: this MUST run
+/// AFTER the user has acked the closing dialog. The remover's script only
+/// waits 60s (300 * 200ms) for `pid` to die before giving up for good — arm
+/// it before a modal dialog that waits on a human indefinitely, and a human
+/// slower than 60s leaves the artifact alive while the message we already
+/// showed promised it gone. `pid` is a parameter (not `std::process::id()`
+/// read internally) so this is testable against a throwaway process, the
+/// same pattern `spawn_self_delete`'s own tests use.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn arm_app_removal(planned: &AppRemovalOutcome, pid: u32) {
+    match planned {
+        AppRemovalOutcome::Scheduled(target) => {
+            if let Err(e) = spawn_self_delete(target, pid) {
+                // The message already promised removal; this is the only trace
+                // left if arming itself fails (guard rejection, spawn error).
+                tracing::error!(target = %target.display(), error = %e, "app removal failed to arm after user ack");
+            }
+        }
+        // No NSIS off Windows — plan_app_removal never yields HandOff here.
+        AppRemovalOutcome::HandOff(u) => {
+            tracing::error!(uninstaller = %u.display(), "hand-off planned on a platform with no external uninstaller");
+        }
+        AppRemovalOutcome::Skipped(_) => {}
+    }
+}
+
+/// Windows/other: there is no `spawn_self_delete` to call — a `Scheduled` plan
+/// cannot be produced here, so it means the two halves have drifted apart.
+/// `HandOff` is the real Windows path (830): launch the NSIS uninstaller.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn arm_app_removal(planned: &AppRemovalOutcome, _pid: u32) {
+    match planned {
+        AppRemovalOutcome::Scheduled(target) => {
+            tracing::error!(target = %target.display(), "app removal was scheduled on a platform with no self-delete — nothing armed");
+        }
+        AppRemovalOutcome::HandOff(uninstaller) => {
+            if let Err(e) = spawn_external_uninstaller(uninstaller) {
+                tracing::error!(uninstaller = %uninstaller.display(), error = %e, "external uninstaller failed to launch after user ack");
+            }
+        }
+        AppRemovalOutcome::Skipped(_) => {}
+    }
+}
+
+/// Launch the NSIS uninstaller so it outlives this process (830).
+///
+/// Outliving us is the whole point: NSIS cannot delete a running binary, which
+/// is why it relaunches itself from %TEMP%. No creation flags — a Windows child
+/// already survives its parent (the KILL_ON_JOB_CLOSE job is assigned to the
+/// sidecar alone, never to this process), and DETACHED_PROCESS + CREATE_NO_WINDOW
+/// is the combination the installer smoke lesson warns against. It is also
+/// deliberately NOT silent: the user keeps the uninstaller's own confirmation
+/// and progress, which is what "Apps & features" would have shown them.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn spawn_external_uninstaller(uninstaller: &Path) -> Result<(), String> {
+    if !is_safe_external_uninstaller(uninstaller) {
+        return Err(format!(
+            "{}: refused (unsafe uninstaller path — guard)",
+            uninstaller.display()
+        ));
+    }
+    std::process::Command::new(uninstaller)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", uninstaller.display()))
 }
 
 /// Pure selective removal sweep (no `AppHandle`) so the per-option matrix AND the
@@ -888,6 +1079,14 @@ pub fn selective_reset_paths(
         remove_dir_guarded(&mut report, data_dir, home, &owned_bases);
         remove_dir_guarded(&mut report, config_dir, home, &owned_bases);
         for dir in &library_dirs {
+            // 828: on Windows this is `%LOCALAPPDATA%\com.nexe.app`, held open
+            // by our own live WebView2. The in-process sweep cannot win the
+            // sharing violation; the deferred cmd.exe helper removes it after
+            // we exit. Sweeping it here only fills `report.failures` with a
+            // lie the closing dialog then prints next to "removed on close".
+            if cfg!(windows) {
+                continue;
+            }
             remove_dir_guarded(&mut report, dir, home, &owned_bases);
         }
         // Pre-1.0.7 leftovers (2026-07-23, live-verified residue).
@@ -1205,6 +1404,10 @@ fn app_removal_summary(artifact: &AppArtifact) -> String {
             "• The application itself / l'aplicació:\n  {}\n• Our entries in the system secret store (Keychain / Credential Manager / keyring)\n\nYour data is only removed if you also ticked the data box. / Les teves dades només s'esborren si també has marcat la casella de dades.",
             p.display()
         ),
+        AppArtifact::ExternalUninstaller(p) => format!(
+            "• The application itself, via its uninstaller / l'aplicació, amb el seu desinstal·lador:\n  {}\n• Our entries in the system secret store (Keychain / Credential Manager / keyring)\n\nThe uninstaller opens as nexe closes; follow its steps to finish. / El desinstal·lador s'obrirà en tancar-se nexe; segueix-ne els passos per acabar.",
+            p.display()
+        ),
         AppArtifact::NotSelfRemovable(reason) => format!(
             "• Our entries in the system secret store (Keychain / Credential Manager / keyring)\n\nThe application files CANNOT be removed by nexe itself / els fitxers de l'aplicació NO els pot esborrar el propi nexe:\n  {reason}"
         ),
@@ -1221,6 +1424,7 @@ fn completion_message(
     report: &UninstallReport,
     data_done: bool,
     app_removal: Option<&AppRemovalOutcome>,
+    deferred_cache: Option<&Path>,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     if data_done {
@@ -1238,12 +1442,22 @@ fn completion_message(
             "• The application will be removed as it closes / l'aplicació s'esborrarà en tancar-se:\n  {}",
             p.display()
         )),
+        Some(AppRemovalOutcome::HandOff(u)) => lines.push(format!(
+            "• The uninstaller will open as nexe closes — finish there to remove the app / el desinstal·lador s'obrirà en tancar-se nexe; acaba-hi per esborrar l'aplicació:\n  {}",
+            u.display()
+        )),
         Some(AppRemovalOutcome::Skipped(reason)) => lines.push(format!(
             "• The application was NOT removed / l'aplicació NO s'ha esborrat:\n  {reason}"
         )),
         None => lines.push(
             "• The application stays installed and usable. / L'aplicació segueix instal·lada i utilitzable.".to_string(),
         ),
+    }
+    if let Some(p) = deferred_cache {
+        lines.push(format!(
+            "• The browser cache is in use until nexe closes; it is removed right after / la memòria cau del navegador s'esborra just en tancar-se nexe:\n  {}",
+            p.display()
+        ));
     }
     lines.push(String::new());
     lines.push("nexe will close now. / nexe es tancarà ara.".to_string());
@@ -1380,6 +1594,8 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
     // "configuration, keys and state", and the app removal says the secret
     // store is cleared. Deleting twice is idempotent.
     let wipe_secrets = (data_confirmed && opts.library) || app_confirmed;
+    let home_for_deferred = home.clone();
+    let library_wipe_confirmed = data_confirmed && opts.library;
     let report = tauri::async_runtime::spawn_blocking(move || {
         let mut report = UninstallReport::default();
         if data_confirmed {
@@ -1398,14 +1614,19 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
         r
     });
 
-    // 5. Arm the app remover AFTER the sweep: the helper only waits for our pid,
-    //    so ordering is free, and doing it last means a sweep that dies never
-    //    leaves a scheduled deletion behind.
+    // 5. PLAN app removal (pure — no filesystem/process effects) so the
+    //    closing message can name the target truthfully. Reuses `artifact`,
+    //    already resolved before gate B's own dialog.
     let app_removal = if app_confirmed {
-        Some(schedule_app_removal())
+        Some(plan_app_removal(artifact.as_ref()))
     } else {
         None
     };
+
+    // 5b. PLAN the deferred cache removal (828) — also pure, and also before
+    //     the message, so the dialog does not report as a failure something we
+    //     are about to handle.
+    let deferred_cache = plan_deferred_cache_delete(&home_for_deferred, library_wipe_confirmed);
 
     if report.all_ok() {
         tracing::info!(opts = %opts_for_log, removal = ?app_removal, "uninstall complete — exiting");
@@ -1415,7 +1636,12 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
 
     // 6. Say what happened and WAIT for the OK (836: the app used to vanish
     //    mid-uninstall with no word, which reads as a crash).
-    let closing = completion_message(&report, data_confirmed, app_removal.as_ref());
+    let closing = completion_message(
+        &report,
+        data_confirmed,
+        app_removal.as_ref(),
+        deferred_cache.as_deref(),
+    );
     {
         let app = app.clone();
         let _ = tauri::async_runtime::spawn_blocking(move || {
@@ -1427,6 +1653,21 @@ pub async fn uninstall_with_options(app: AppHandle, opts: UninstallOptions) -> U
                 .blocking_show()
         })
         .await;
+    }
+
+    // 7. ARM the remover only now, AFTER the human has acked (#836). The
+    //    remover's 60s budget starts here, right before we exit — not while
+    //    a human was still reading the dialog above.
+    if let Some(planned) = &app_removal {
+        arm_app_removal(planned, std::process::id());
+    }
+    // 828: same ordering rule — the cache remover only starts counting once
+    // the human is done reading.
+    #[cfg(windows)]
+    if let Some(target) = &deferred_cache {
+        if let Err(e) = spawn_deferred_dir_delete(target, std::process::id()) {
+            tracing::error!(target = %target.display(), error = %e, "deferred cache removal failed to arm");
+        }
     }
 
     // MC-057: EXIT_CONFIRMED before app.exit(0) so ExitRequested does not pop a
@@ -2530,7 +2771,7 @@ mod tests {
         // 836: the app used to quit silently mid-wipe ("sembla que tomba").
         let ok = super::UninstallReport::default();
 
-        let data_only = super::completion_message(&ok, true, None);
+        let data_only = super::completion_message(&ok, true, None, None);
         assert!(data_only.contains("Dades esborrades correctament"));
         assert!(
             data_only.contains("stays installed and usable"),
@@ -2539,7 +2780,7 @@ mod tests {
 
         let mut failed = super::UninstallReport::default();
         failed.failures.push("/tmp/x: boom".to_string());
-        let msg = super::completion_message(&failed, true, None);
+        let msg = super::completion_message(&failed, true, None, None);
         assert!(
             !msg.contains("Dades esborrades correctament"),
             "a failed sweep must not claim success: {msg}"
@@ -2552,17 +2793,229 @@ mod tests {
         let scheduled = super::AppRemovalOutcome::Scheduled(std::path::PathBuf::from(
             "/Applications/nexe-app.app",
         ));
-        let msg = super::completion_message(&ok, true, Some(&scheduled));
+        let msg = super::completion_message(&ok, true, Some(&scheduled), None);
         assert!(msg.contains("/Applications/nexe-app.app"));
         assert!(!msg.contains("stays installed and usable"));
 
         let skipped = super::AppRemovalOutcome::Skipped("packaged install".to_string());
-        let msg = super::completion_message(&ok, false, Some(&skipped));
+        let msg = super::completion_message(&ok, false, Some(&skipped), None);
         assert!(msg.contains("NOT removed") && msg.contains("packaged install"));
         assert!(
             !msg.contains("Dades esborrades correctament"),
             "app-only uninstall must not claim a data wipe: {msg}"
         );
+    }
+
+    /// 828: the wait MUST sit inside the `for /l` body. The first script put
+    /// `& timeout` after the `for`, so 120 tight polls finished while nexe
+    /// was still alive and `rmdir` never ran. Compiled on every OS — spawn is
+    /// Windows-only, the string is the contract.
+    #[test]
+    fn deferred_script_waits_inside_the_loop_and_only_then_removes() {
+        let target = std::path::Path::new(r"C:\Users\u\AppData\Local\com.nexe.app");
+        let script = super::deferred_dir_delete_script(target, 4242);
+        assert!(
+            script.contains("PID eq 4242"),
+            "must watch our pid: {script}"
+        );
+        assert!(
+            script.contains(r#"|| (rmdir /s /q "C:\Users\u\AppData\Local\com.nexe.app" & exit /b 0)"#),
+            "the removal must be CONDITIONAL on the pid being gone: {script}"
+        );
+        assert!(
+            script.ends_with("ping 127.0.0.1 -n 2 >nul)"),
+            "the delay must be the last statement INSIDE the do-body: {script}"
+        );
+        assert!(
+            !script.contains(")) & "),
+            "chaining the delay AFTER the for (the original #828 bug) is `)) & …`: {script}"
+        );
+        assert!(
+            !script.contains("timeout"),
+            "timeout.exe dies with stdin redirected / CREATE_NO_WINDOW: {script}"
+        );
+        assert!(
+            script.contains("(1,1,60)"),
+            "the wait must be bounded (~60s): {script}"
+        );
+    }
+
+    // ── The Windows hand-off to the NSIS uninstaller (830) ────────────────────
+    // A sibling of `self_removal`, which is cfg'd to macOS/Linux — that gate is
+    // exactly why Windows had no coverage of the app-removal arm at all.
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    mod external_uninstaller {
+        use std::path::{Path, PathBuf};
+
+        /// 828: the EBWebView dir is held by our OWN live WebView2, so it can
+        /// only be planned for removal, never removed in the sweep.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn the_live_webview_cache_is_planned_not_swept() {
+            use super::super::plan_deferred_cache_delete;
+
+            // Model a home whose %LOCALAPPDATA%\com.nexe.app really exists.
+            let home = std::env::temp_dir().join("nexe-828-home");
+            let cache = home
+                .join("AppData")
+                .join("Local")
+                .join("com.nexe.app")
+                .join("EBWebView");
+            std::fs::create_dir_all(&cache).expect("temp cache");
+
+            let planned = plan_deferred_cache_delete(&home, true);
+            let library = home.join("AppData").join("Local").join("com.nexe.app");
+            assert_eq!(
+                planned,
+                Some(library.clone()),
+                "a confirmed library wipe must plan the deferred removal"
+            );
+
+            // The in-process sweep must leave that dir alone (and not record it
+            // as a failure): WebView2 still holds it. data/config can go.
+            let data = home.join("Roaming").join("com.nexe.app");
+            let config = home.join("Roaming").join("com.nexe.app").join("config");
+            std::fs::create_dir_all(&data).expect("temp data");
+            std::fs::create_dir_all(&config).expect("temp config");
+            let opts = super::super::UninstallOptions {
+                library: true,
+                ..Default::default()
+            };
+            let report = super::super::selective_reset_paths(&config, &data, &home, &opts);
+            assert!(
+                library.exists(),
+                "828: the live WebView2 dir is planned, not swept"
+            );
+            assert!(
+                report.failures.iter().all(|f| !f.contains("com.nexe.app")),
+                "the closing dialog must not list a deferred dir as a failure: {:?}",
+                report.failures
+            );
+
+            // Not requested → nothing planned (no surprise deletions).
+            assert_eq!(plan_deferred_cache_delete(&home, false), None);
+
+            let _ = std::fs::remove_dir_all(&home);
+            // Nothing on disk → nothing to defer.
+            assert_eq!(plan_deferred_cache_delete(&home, true), None);
+        }
+
+        /// The message must not report as lost something we are about to remove.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn the_user_is_told_the_cache_goes_on_close() {
+            use super::super::{completion_message, UninstallReport};
+            let cache = PathBuf::from(r"C:\Users\u\AppData\Local\com.nexe.app");
+            let msg = completion_message(&UninstallReport::default(), true, None, Some(&cache));
+            assert!(
+                msg.contains("com.nexe.app") && msg.contains("in use until nexe closes"),
+                "828: the closing message must explain the deferral: {msg}"
+            );
+        }
+
+        /// 830: before this, Windows had ZERO tests on the app-removal arm —
+        /// the modal's text pointer could be changed to a false promise with
+        /// the suite fully green.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn artifact_is_the_uninstaller_next_to_the_exe() {
+            use super::super::{app_artifact, AppArtifact};
+
+            // A real install layout: uninstall.exe sits beside the exe. Build
+            // it in a temp dir because app_artifact requires the file to exist
+            // (a promise to launch a missing binary is exactly the bug).
+            let dir = std::env::temp_dir().join("nexe-830-artifact");
+            let _ = std::fs::create_dir_all(&dir);
+            let uninst = dir.join("uninstall.exe");
+            std::fs::write(&uninst, b"stub").expect("temp uninstaller");
+            let exe = dir.join("nexe-app.exe");
+            assert_eq!(
+                app_artifact(&exe, None),
+                AppArtifact::ExternalUninstaller(uninst.clone()),
+                "ticking the box must hand off to the real uninstaller"
+            );
+
+            // No uninstaller (a dev/cargo run) → say so, never promise.
+            std::fs::remove_file(&uninst).expect("cleanup");
+            assert!(matches!(
+                app_artifact(&exe, None),
+                AppArtifact::NotSelfRemovable(_)
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn only_a_real_uninstaller_path_passes_the_guard() {
+            use super::super::is_safe_external_uninstaller;
+            assert!(is_safe_external_uninstaller(Path::new(
+                r"C:\Users\u\AppData\Local\nexe-app\uninstall.exe"
+            )));
+            // Not absolute.
+            assert!(!is_safe_external_uninstaller(Path::new(
+                r"nexe-app\uninstall.exe"
+            )));
+            // Traversal.
+            assert!(!is_safe_external_uninstaller(Path::new(
+                r"C:\Users\u\..\evil\uninstall.exe"
+            )));
+            // Any other neighbour binary is never launchable.
+            assert!(!is_safe_external_uninstaller(Path::new(
+                r"C:\Users\u\AppData\Local\nexe-app\nexe-app.exe"
+            )));
+            // Root-level dropper.
+            assert!(!is_safe_external_uninstaller(Path::new(
+                r"C:\uninstall.exe"
+            )));
+        }
+
+        /// The whole point of 830: a hand-off must reach the ARM, not be
+        /// silently classified as "nothing to do" like NotSelfRemovable is.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn a_hand_off_plan_is_not_a_skip() {
+            use super::super::{plan_app_removal, AppArtifact, AppRemovalOutcome};
+            let u = PathBuf::from(r"C:\Users\u\AppData\Local\nexe-app\uninstall.exe");
+            let artifact = AppArtifact::ExternalUninstaller(u.clone());
+            assert_eq!(
+                plan_app_removal(Some(&artifact)),
+                AppRemovalOutcome::HandOff(u)
+            );
+        }
+
+        /// 830's symptom was the message promising a removal that never
+        /// happened. Both user-facing strings must name the uninstaller.
+        #[cfg(target_os = "windows")]
+        #[test]
+        fn the_user_is_told_the_uninstaller_will_open() {
+            use super::super::{
+                app_removal_summary, completion_message, AppArtifact, AppRemovalOutcome,
+                UninstallReport,
+            };
+            let u = PathBuf::from(r"C:\Users\u\AppData\Local\nexe-app\uninstall.exe");
+
+            let summary = app_removal_summary(&AppArtifact::ExternalUninstaller(u.clone()));
+            assert!(
+                summary.contains("uninstall.exe"),
+                "the gate must name what it will launch: {summary}"
+            );
+            assert!(
+                !summary.contains("CANNOT be removed"),
+                "830: it is removable via the uninstaller — the old text lied the other way"
+            );
+
+            let msg = completion_message(
+                &UninstallReport::default(),
+                false,
+                Some(&AppRemovalOutcome::HandOff(u)),
+                None,
+            );
+            assert!(
+                msg.contains("uninstall.exe") && msg.contains("uninstaller will open"),
+                "the closing message must set the expectation: {msg}"
+            );
+        }
     }
 
     // ── The self-removal mechanism (only where it exists) ─────────────────────
@@ -2723,6 +3176,82 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             assert!(gone, "the remover must delete {} ", target.display());
+        }
+
+        // ── #836: planning the message must never arm the remover ─────────────
+
+        #[test]
+        fn planning_removal_does_not_touch_the_filesystem() {
+            // The closing dialog names the removal target from `plan_app_removal`
+            // — this must be a pure prediction. If it secretly armed the
+            // remover, the 60s clock would start while the human is still
+            // reading the dialog (the exact #836 race).
+            let tmp = TempDir::new().unwrap();
+            let target = make_target(tmp.path());
+            let artifact = super::super::AppArtifact::SelfRemovable(target.clone());
+            let planned = super::super::plan_app_removal(Some(&artifact));
+            assert_eq!(
+                planned,
+                super::super::AppRemovalOutcome::Scheduled(target.clone())
+            );
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert!(
+                target.exists(),
+                "planning must never touch the filesystem or spawn a remover"
+            );
+        }
+
+        #[test]
+        fn planning_with_no_artifact_is_skipped_without_touching_anything() {
+            let planned = super::super::plan_app_removal(None);
+            assert!(matches!(
+                planned,
+                super::super::AppRemovalOutcome::Skipped(_)
+            ));
+        }
+
+        #[test]
+        fn arm_app_removal_actually_arms_the_remover() {
+            // Same mechanism as self_delete_removes_the_target_once_the_pid_is_gone,
+            // but going through arm_app_removal(planned, pid) — the call
+            // uninstall_with_options makes AFTER the user's ack.
+            let tmp = TempDir::new().unwrap();
+            let target = make_target(tmp.path());
+            let mut victim_pid = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("sh must be spawnable");
+
+            let planned = super::super::AppRemovalOutcome::Scheduled(target.clone());
+            super::super::arm_app_removal(&planned, victim_pid.id());
+            assert!(target.exists(), "still alive → nothing removed yet");
+
+            victim_pid.kill().unwrap();
+            victim_pid.wait().unwrap();
+
+            let mut gone = false;
+            for _ in 0..100 {
+                if !target.exists() {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert!(gone, "arm_app_removal must actually arm the remover");
+        }
+
+        #[test]
+        fn arm_app_removal_is_a_no_op_for_a_skipped_plan() {
+            let tmp = TempDir::new().unwrap();
+            let target = make_target(tmp.path());
+            let planned = super::super::AppRemovalOutcome::Skipped("not requested".to_string());
+            super::super::arm_app_removal(&planned, std::process::id());
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            assert!(target.exists(), "a Skipped plan must never spawn a remover");
         }
     }
 }
